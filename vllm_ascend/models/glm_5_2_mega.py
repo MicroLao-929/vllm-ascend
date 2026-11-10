@@ -1,7 +1,7 @@
 """GLM-5.2 MegaKernel integration for vLLM-Ascend.
 
 When ``ENABLE_MEGAKERNEL=1`` and the model is ``glm_moe_dsa``
-(``GlmMoeDsaForCausalLM``), the forward is routed through the MegaKernel
+(``GlmMoeDsaForCausalLM``), decode is routed through the MegaKernel
 (``blockrt.models.glm_5_2.Glm52MegaKernel``) instead of the vLLM/Ascend
 op-by-op path.
 
@@ -20,11 +20,12 @@ This mirrors the sglang_npu ``qwen3_moe.py`` integration:
 
 Usage:
 
-    ENABLE_MEGAKERNEL=1 vllm serve /path/to/GLM-5.2-10L-W4A8C8-A5 \
-        --tensor-parallel-size 1 ...
+    ENABLE_MEGAKERNEL=1 vllm serve /path/to/GLM-5.2-W4A8C8-A5 \
+        --tensor-parallel-size 8 ...
 
 Notes:
-* TP must be 1 in this milestone (``Glm52MegaKernel(tp_size=1)``).
+* Native prefill and Mega decode share rank-local weights and packed KV.
+  The BF16 RoPE payload changes layout when cache ownership switches.
 * ``MEGA_KERNEL_HOME`` / megakernel python path must be on ``PYTHONPATH``
   (``blockrt`` import) and the megakernel CANN registration must be done
   (``megakernel/install.sh``).
@@ -45,6 +46,7 @@ from vllm.model_executor.models.deepseek_v2 import GlmMoeDsaForCausalLM
 from vllm.sequence import IntermediateTensors
 
 from vllm.logger import logger
+from vllm_ascend import envs
 
 _ENABLED = os.environ.get("ENABLE_MEGAKERNEL", "0") in ("1", "true", "True")
 
@@ -88,8 +90,15 @@ def _model_args_from_hf_config(config: Any):
     ):
         val = getattr(config, key, None)
         if val is not None:
-            setattr(args, key, int(val) if isinstance(val, (int, float)) else val)
+            setattr(args, key, val)
+    for key in ("index_topk_freq", "index_skip_topk_offset", "indexer_types",
+                "indexer_rope_interleave", "rope_interleave", "rope_parameters",
+                "routed_scaling_factor", "norm_topk_prob", "scoring_func"):
+        value = getattr(config, key, None)
+        if value is not None:
+            setattr(args, key, value)
     args.quantized = True
+    args.indexer_native_c8 = True
     # Keep the MTP module enabled when the checkpoint provides MTP layers so
     # the MegaKernel-backed draft (DeepSeekMTPModel) can share this runtime.
     # The target forward never calls the MTP module.
@@ -136,6 +145,40 @@ def _has_usable_metadata(attn_meta: Any) -> bool:
         and getattr(req, "slot_mapping", None) is not None
     )
 
+
+
+def _supports_mega_batch(attn_meta: Any, num_input_tokens: int) -> bool:
+    """The current BSND bridge requires an unpadded, rectangular query batch."""
+    req = getattr(attn_meta, "req_metadata", None) or attn_meta
+    batch_size = int(req.seq_lens.shape[0])
+    num_tokens = int(attn_meta.num_actual_tokens)
+    # The native path preserves padded model-runner output extents. MK's
+    # captured output is sized to actual tokens, so keep padding native.
+    if batch_size < 1 or num_tokens != num_input_tokens or num_tokens % batch_size:
+        return False
+    starts = getattr(req, "query_start_loc", None)
+    ends = getattr(attn_meta, "cum_query_lens", None)
+    if starts is None and ends is None:
+        return num_tokens == batch_size
+    if batch_size == 1:
+        return True
+    # Prefer host metadata when supplied. SFA currently only exposes device
+    # prefix ends; checking multi-request rectangularity then requires one
+    # host transfer. The common single-request path above does not sync.
+    cpu_starts = getattr(req, "query_start_loc_cpu", None)
+    if cpu_starts is not None:
+        starts = cpu_starts
+    if starts is not None:
+        prefix = starts[:batch_size + 1].cpu().tolist()
+        if len(prefix) != batch_size + 1 or prefix[0] != 0:
+            return False
+        lengths = [b - a for a, b in zip(prefix, prefix[1:])]
+    else:
+        prefix = ends[:batch_size].cpu().tolist()
+        if len(prefix) != batch_size:
+            return False
+        lengths = [prefix[0], *(b - a for a, b in zip(prefix, prefix[1:]))]
+    return all(length == num_tokens // batch_size for length in lengths)
 
 def _cache_tensors(cache: Any) -> tuple[torch.Tensor, ...]:
     """Normalize a vLLM bound KV cache into a tuple of tensors."""
@@ -193,11 +236,15 @@ class _MegaKernelGLM52State:
                     )
                 )
 
+        if vllm_config.speculative_config is None or not envs.VLLM_ASCEND_MEGAKERNEL_MTP:
+            self.model_args.num_nextn_predict_layers = 0
+
         num_blocks = self._num_blocks()
         self.num_blocks = num_blocks
         self.k_cache, self.index_k_buffer, self.index_k_scale_buffer = (
             self._borrow_vllm_kv_cache(vllm_model)
         )
+        self._kv_rope_interleaved = False
         # indexer_rope indexes this table with absolute token positions.  Reuse
         # vLLM's complete RoPE table just like the SGLang handoff does; a
         # per-step [num_tokens, 64] buffer is invalid once decode positions are
@@ -255,6 +302,8 @@ class _MegaKernelGLM52State:
             self.model_args, weight_dict,
             tp_size=self.tp_size, tp_rank=self.tp_rank,
             vllm_ascend_weights=True,
+            compute_lm_head=False,
+            enable_static_fusion=False,
         )
         # MegaKernel now owns Parameter wrappers for the borrowed tensors; the
         # vLLM wrapper no longer needs to keep a second set of Python refs.
@@ -292,6 +341,18 @@ class _MegaKernelGLM52State:
         # Share this runtime with the MegaKernel MTP draft (same checkpoint),
         # so the draft does not reload weights or build a second runtime.
         _MEGA_STATE_REGISTRY[str(vllm_config.model_config.model)] = self
+
+    def set_kv_rope_layout(self, interleaved: bool) -> None:
+        if self._kv_rope_interleaved == interleaved:
+            return
+        from blockrt.models.glm_5_2.vllm_handoff import convert_vllm_mla_cache_layout
+
+        for cache in self.k_cache:
+            convert_vllm_mla_cache_layout(
+                cache, self.model_args.kv_lora_rank, self.rope_head_dim,
+                to_megakernel=interleaved,
+            )
+        self._kv_rope_interleaved = interleaved
 
     @staticmethod
     def _validate_index_rope_cache(cache: torch.Tensor, owner: str) -> torch.Tensor:
@@ -401,6 +462,8 @@ class _MegaKernelGLM52State:
                 "MegaKernel: cannot locate vLLM decoder layers for shared KV cache"
             )
 
+        from blockrt.models.glm_5_2.vllm_handoff import alias_vllm_cache_for_capture
+
         main_caches: list[torch.Tensor] = []
         indexer_caches: list[torch.Tensor] = []
         indexer_scale_caches: list[torch.Tensor] = []
@@ -439,7 +502,9 @@ class _MegaKernelGLM52State:
                     f"[num_blocks, {self.block_size}, 1, "
                     f"{self.packed_kv_dim}]."
                 )
-            main_caches.append(packed)
+            # Native caches may be inference tensors. Borrow normal aliases
+            # so scatter -> reshape -> attention remains connected in MK.
+            main_caches.append(alias_vllm_cache_for_capture(packed))
 
             indexer = getattr(self_attn, "indexer", None)
             indexer_cache_module = getattr(indexer, "k_cache", None)
@@ -461,12 +526,14 @@ class _MegaKernelGLM52State:
                 )
                 continue
 
-            indexer_k = indexer_cache[0]
+            indexer_k = alias_vllm_cache_for_capture(indexer_cache[0])
             indexer_caches.append(
                 indexer_k.reshape(-1, self.index_head_dim)
             )
             if len(indexer_cache) == 2:
-                indexer_scale_caches.append(indexer_cache[1].reshape(-1, 1))
+                indexer_scale_caches.append(
+                    alias_vllm_cache_for_capture(indexer_cache[1]).reshape(-1, 1)
+                )
             else:
                 indexer_scale_caches.append(
                     torch.zeros((packed.shape[0] * packed.shape[1], 1), dtype=torch.float32, device=packed.device)
@@ -488,7 +555,7 @@ class _MegaKernelGLM52State:
             max_tokens = max(self.max_tokens_default, batch_size * 4)
             self.meta_buffers[batch_size] = {
                 "input_ids": torch.empty(
-                    (max_tokens,), dtype=torch.int32, device="npu"
+                    (max_tokens,), dtype=torch.int64, device="npu"
                 ),
                 "positions": torch.empty(
                     (max_tokens,), dtype=torch.int64, device="npu"
@@ -691,10 +758,19 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         self.vllm_config = vllm_config
         self._mega_state: Optional[_MegaKernelGLM52State] = None
         self._mega_raw_weights: Optional[Dict[str, torch.Tensor]] = None
+        self._mega_debug = None
         logger.info(
             "[MegaKernel] AscendGlm52MegaForCausalLM initialized, "
             f"ENABLE_MEGAKERNEL={_mega_enabled()}",
         )
+
+    def _get_mega_debug(self):
+        directory = envs.VLLM_ASCEND_MEGAKERNEL_DUMP_DIR
+        if directory and self._mega_debug is None:
+            from blockrt.models.glm_5_2.vllm_debug import VllmMegaDebug
+
+            self._mega_debug = VllmMegaDebug(directory, self.tp_rank)
+        return self._mega_debug if directory else None
 
     def _ensure_mega(self, vllm_config: VllmConfig) -> _MegaKernelGLM52State:
         if self._mega_state is None:
@@ -751,8 +827,8 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        attn_meta = None
         if _mega_enabled() and input_ids is not None:
-            attn_meta = None
             try:
                 fc = get_forward_context()
                 if fc is not None:
@@ -763,7 +839,13 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
                 attn_meta is not None
                 and self._is_decode_step(attn_meta)
                 and _has_usable_metadata(attn_meta)
+                and _supports_mega_batch(attn_meta, input_ids.shape[0])
             )
+            # Optional debug control permits native decode with the same
+            # loaded weights/caches, for comparisons without another TP model.
+            debug = self._get_mega_debug()
+            if debug is not None and debug.controls().get("native_decode", False):
+                is_decode = False
             if is_decode:
                 try:
                     return self._forward_mega(input_ids, positions, attn_meta)
@@ -772,17 +854,24 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
 
                     traceback.print_exc()
                     raise
+        if self._mega_state is not None:
+            self._mega_state.set_kv_rope_layout(False)
+        debug = self._get_mega_debug()
+        if debug is not None and input_ids is not None and _has_usable_metadata(attn_meta):
+            with debug.native(self, input_ids, positions, attn_meta):
+                return super().forward(
+                    input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+                )
         return super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
 
+    @torch.profiler.record_function("glm52_target_logits_head")
     def compute_logits(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor | None:
-        # In mega mode the model forward already returned logits; keep them
-        # as-is (skip the vLLM LM-head pass).
-        if _mega_enabled() and self._mega_state is not None:
-            return hidden_states
+        # Both native prefill and Mega decode return normalized hidden states.
+        # Keep vLLM responsible for its TP vocabulary head and logits processing.
         return super().compute_logits(hidden_states)
 
     def load_weights(self, weights):
@@ -818,16 +907,19 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
 
     @staticmethod
     def _is_decode_step(attn_meta: Any) -> bool:
-        """True for a pure decode batch (AscendAttentionState.DecodeOnly).
+        """Route decode and speculative target verification through Mega.
 
-        Prefill and mixed chunked-prefill batches keep using the native
-        vLLM-Ascend path; only decode steps are routed through MegaKernel.
+        SpecDecoding carries multiple candidate tokens per request. Prefill
+        and mixed chunked-prefill batches retain the native path.
         """
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
         state = getattr(attn_meta, "attn_state", None)
         if state is not None:
-            return state == AscendAttentionState.DecodeOnly
+            return state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            )
         # Fallback: no prefill tokens but some decode tokens.
         return (
             getattr(attn_meta, "num_prefills", 0) == 0
@@ -842,50 +934,44 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         vLLM stores per-position cos/sin as [B, rotary_dim//2] pair
         coefficients (interleaved rope, is_neox_style=False).  MegaKernel's
         MLA kernels consume per-token [B, 64] cos/sin tensors with the pair
-        coefficients repeat-interleaved (c0,c0,c1,c1,...).  The DSA indexer
+        coefficients repeated in two halves (c0,c1,...,c0,c1,...). The kernel
+        deinterleaves the input into even/odd halves internally. The DSA indexer
         separately borrows vLLM's full [max_positions, 64] compact table.
         """
         if num_tokens <= 0:
             return
 
-        def _cos_sin(rope, positions_cpu):
-            # Reproduce vLLM cos_sin_cache on the host: cache = cat(cos, sin)
-            # with rotary_dim//2 interleaved pair coefficients per position.
-            # Computed on CPU (and copied in) to avoid NPU index_select, whose
-            # Index kernel fails to launch on this stack (driver halMemAlloc).
-            inv_freq = 1.0 / (
-                rope.base
-                ** (torch.arange(0, rope.rotary_dim, 2, dtype=torch.float32) / rope.rotary_dim)
-            )
-            freqs = torch.einsum("i,j->ij", positions_cpu.float(), inv_freq)
-            return freqs.cos(), freqs.sin()
-
-        pos_cpu = positions[:num_tokens].cpu()
-        attn0 = self.model.layers[0].self_attn
-
-        cos32, sin32 = _cos_sin(attn0.rotary_emb, pos_cpu)
-        state.mla_cos_cache[:num_tokens].copy_(
-            cos32.repeat_interleave(2, dim=-1).to(torch.bfloat16).npu()
-        )
-        state.mla_sin_cache[:num_tokens].copy_(
-            sin32.repeat_interleave(2, dim=-1).to(torch.bfloat16).npu()
-        )
+        rope = self.model.layers[0].self_attn.rotary_emb
+        cache = rope.cos_sin_cache
+        selected = cache.index_select(0, positions[:num_tokens].long())
+        cos, sin = selected.chunk(2, dim=-1)
+        state.mla_cos_cache[:num_tokens].copy_(cos.repeat(1, 2))
+        state.mla_sin_cache[:num_tokens].copy_(sin.repeat(1, 2))
 
         # The indexer uses absolute positions to read vLLM's full
         # ``state.index_cos_sin_cache``.  Do not build a per-token table here:
         # passing that table together with absolute positions double-indexes
         # it and reads out of bounds after prefill.
 
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    @torch.profiler.record_function("glm52_target_mega_forward")
     def _forward_mega(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         attn_meta: AscendDSAMetadata,
     ) -> torch.Tensor:
+        # BlockRT joins graph edges through Tensor._base. Inference tensors
+        # omit view tracking, disconnecting reshape/transpose consumers from
+        # their producers. Keep ordinary tensors with autograd disabled for
+        # this path, including persistent metadata and the first graph capture.
         # The metadata may carry per-request fields directly or under a
         # `req_metadata` sub-object (AscendDSAMetadata vs. MLA/SFA metadata).
         req = getattr(attn_meta, "req_metadata", None) or attn_meta
         state = self._ensure_mega(self.vllm_config)  # type: ignore[attr-defined]
+
+        state.set_kv_rope_layout(True)
 
         num_tokens = int(
             getattr(attn_meta, "num_actual_tokens", None)
@@ -912,10 +998,10 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         self._fill_rope_caches(state, positions, num_tokens)
 
         # ── Copy per-step inputs into persistent buffers (stable addresses) ──
-        ids = input_ids.to(torch.int32).contiguous()
+        ids = input_ids.to(torch.int64).contiguous()
         pos = positions.to(torch.int64).contiguous()
-        bufs["input_ids"][:num_tokens].copy_(ids)
-        bufs["positions"][:num_tokens].copy_(pos)
+        bufs["input_ids"][:num_tokens].copy_(ids[:num_tokens])
+        bufs["positions"][:num_tokens].copy_(pos[:num_tokens])
 
         # MegaKernel's scatter_update ABI requires int64 indices.  vLLM's
         # attention metadata may expose int32 slot mappings, so normalize
@@ -943,22 +1029,36 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
             qsl = qsl_t.to(torch.int64).contiguous()
             if qsl.shape[0] >= batch_size + 1:
                 q_seq = qsl[1 : batch_size + 1] - qsl[:batch_size]
+            elif qsl.shape[0] == batch_size:
+                # AscendSFA cum_query_lens stores prefix ends without a
+                # leading zero, including multi-token speculative verify.
+                q_seq = torch.cat((qsl[:1], qsl[1:] - qsl[:-1]))
             else:
-                q_seq = torch.ones(
-                    (batch_size,), dtype=torch.int64, device=qsl.device
-                )
+                raise RuntimeError("MegaKernel: query lengths do not match request batch")
             bufs["q_seq_len"][:batch_size].copy_(q_seq.to(torch.int32))
 
         fbi = state.build_forward_batch_info(attn_meta, bufs, num_tokens)
-        logits = state.mega.forward(
-            fbi,
-            bufs["input_ids"][:num_tokens],
-            bufs["positions"][:num_tokens],
-            None,
-            None,
-        )
-        # vLLM sampling expects float32 logits [num_tokens, vocab_size].
-        return logits.to(torch.float32)
+        debug = self._get_mega_debug()
+        from contextlib import nullcontext
+
+        profile = (debug.profile_target(
+            state.mega, fbi,
+            attention_state=getattr(getattr(attn_meta, "attn_state", None), "name", None),
+        ) if debug is not None else nullcontext())
+        with profile, torch.profiler.record_function(
+            f"glm52_target_graph_q{num_tokens}_b{batch_size}"
+        ):
+            logits = state.mega.forward(
+                fbi,
+                bufs["input_ids"][:num_tokens],
+                bufs["positions"][:num_tokens],
+                None,
+                None,
+            )
+        if debug is not None:
+            debug.mega(state.mega, bufs["input_ids"][:num_tokens], positions, fbi)
+        # Match the native forward contract; compute_logits runs afterwards.
+        return logits
 
 
 class _MegaMTPStepGraph(nn.Module):

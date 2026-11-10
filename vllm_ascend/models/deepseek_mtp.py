@@ -61,8 +61,21 @@ class AscendDeepSeekMTP(DeepSeekMTP):
             orig_to_new_prefix={"rot.": f"model.layers.{self.config.num_hidden_layers}.rot."},
         )
         loaded_weights = super().load_weights(weights_mapper.apply(weights))
+        self._remove_unloaded_norm_biases()
         self._maybe_set_own_lm_head(loaded_weights)
         return loaded_weights
+
+    def _remove_unloaded_norm_biases(self) -> None:
+        # A main-model norm bias in ModelSlim's description makes AscendRMSNorm
+        # allocate optional biases even for bias-free MTP norms. Drop only the
+        # unfilled optional norm parameters before the loader's final check.
+        for module in self.modules():
+            if (
+                getattr(module, "bias_loaded", None) is False
+                and hasattr(module, "variance_epsilon")
+                and isinstance(getattr(module, "bias", None), nn.Parameter)
+            ):
+                module.register_parameter("bias", None)
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         if "rot" in name:

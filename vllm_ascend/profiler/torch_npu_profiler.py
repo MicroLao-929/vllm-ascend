@@ -23,6 +23,7 @@ import torch_npu
 from vllm.config import ProfilerConfig
 from vllm.profiler.wrapper import WorkerProfiler
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 
 
@@ -47,11 +48,13 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
                 "additional_config.msmonitor_use_daemon and torch profiler cannot be enabled at the same time."
             )
 
+        lightweight = envs.VLLM_ASCEND_PROFILER_LIGHTWEIGHT
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            aic_metrics=(torch_npu.profiler.AiCMetrics.AiCoreNone if lightweight
+                         else torch_npu.profiler.AiCMetrics.PipeUtilization),
             l2_cache=False,
             op_attr=False,
             data_simplification=True,
@@ -68,7 +71,7 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             profile_memory=profiler_config.torch_profiler_with_memory,
             # NOTE: torch_npu.profiler.with_modules is equivalent to torch.profiler.with_stack.
             # The with_stack option in torch_npu.profiler introduces significant time overhead.
-            with_modules=profiler_config.torch_profiler_with_stack,
+            with_modules=profiler_config.torch_profiler_with_stack and not lightweight,
             experimental_config=experimental_config,
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                 profiler_config.torch_profiler_dir,

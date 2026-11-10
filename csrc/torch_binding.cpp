@@ -17,6 +17,12 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/version.h>
+#include <torch_npu/csrc/aten/CustomFunctions.h>
+#include <type_traits>
+#if __has_include("aclnnop/aclnn_swiglu_group_quant.h")
+#include "aclnnop/aclnn_swiglu_group_quant.h"
+#define VLLM_HAS_SWIGLU_GROUP_QUANT_HEADER 1
+#endif
 #include <torch/torch.h>
 #include <ATen/core/Formatting.h>
 #include "acl/acl.h"
@@ -1701,8 +1707,43 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_swiglu_group_quant_npu(
     at::Tensor scale = std::get<1>(output_tensors);
     at::Tensor y_origin = std::get<2>(output_tensors);
 
-    EXEC_NPU_CMD(aclnnSwigluGroupQuant, x, topk_weight, group_index, dst_type_code, quant_mode, group_size,
-                 round_scale, ue8m0_scale, output_origin, group_list_type, clamp_value, y, scale, y_origin);
+#ifdef VLLM_HAS_SWIGLU_GROUP_QUANT_HEADER
+    // CANN SDKs expose two incompatible APIs under this same symbol. Select
+    // from the installed header, rather than shifting output pointers when
+    // an SDK expects scaleOptional/clampLimit/dstTypeMax in the input list.
+    using WithOptionalScale = aclnnStatus (*)(
+        const aclTensor*, const aclTensor*, const aclTensor*, const aclTensor*,
+        int64_t, int64_t, int64_t, bool, double, double, bool,
+        const aclTensor*, const aclTensor*, const aclTensor*, uint64_t*, aclOpExecutor**);
+    if constexpr (std::is_same_v<decltype(&aclnnSwigluGroupQuantGetWorkspaceSize), WithOptionalScale>) {
+        if (quant_mode == 2) {
+            // This SDK's GroupQuant kernel handles HiFloat8, while its
+            // dedicated SwiGLU MX operator provides FP8 + E8M0 block scales.
+            // Reuse TorchNPU's matching SDK adapter and preserve scale bytes.
+            TORCH_CHECK(!topk_weight.has_value() && clamp_value == 0.0 && !round_scale,
+                        "This SDK's SwiGLU MX path requires no routing weight, clipping or rounded scales");
+            auto mx_outputs = at_npu::native::custom_ops::npu_swiglu_mx_quant(
+                x, group_index, -1, true, 0, 7.0, 1.702, 1.0,
+                group_list_type, -1, static_cast<int64_t>(dst_type), "rint", 0, 0.0);
+            if (output_origin) {
+                y_origin = at_npu::native::custom_ops::npu_swiglu(x, -1);
+            }
+            return {std::get<0>(mx_outputs), std::get<1>(mx_outputs).view(at::kFloat8_e8m0fnu), y_origin};
+        }
+        TORCH_CHECK(group_list_type == 0, "This CANN SwigluGroupQuant API supports cumulative group indices only");
+        TORCH_CHECK(quant_mode != 3 || !ue8m0_scale,
+                    "This CANN SwigluGroupQuant API does not support FP8 mode with E8M0 scales");
+        c10::optional<at::Tensor> scale_optional = c10::nullopt;
+        constexpr double DST_TYPE_MAX_DEFAULT = 0.0;
+        EXEC_NPU_CMD(aclnnSwigluGroupQuant, x, topk_weight, group_index, scale_optional,
+                     dst_type_code, quant_mode, group_size, round_scale, clamp_value,
+                     DST_TYPE_MAX_DEFAULT, output_origin, y, scale, y_origin);
+    } else
+#endif
+    {
+        EXEC_NPU_CMD(aclnnSwigluGroupQuant, x, topk_weight, group_index, dst_type_code, quant_mode, group_size,
+                     round_scale, ue8m0_scale, output_origin, group_list_type, clamp_value, y, scale, y_origin);
+    }
 
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, scale, y_origin);
 }

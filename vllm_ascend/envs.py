@@ -28,6 +28,16 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Optional local directory for bounded GLM MegaKernel/native tensor dumps.
+    # Default None disables diagnostics; requires a MegaKernel Dump build.
+    # Not a credential. This path contains model activation diagnostics.
+    "VLLM_ASCEND_MEGAKERNEL_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_MEGAKERNEL_DUMP_DIR"),
+    # Mega MTP draft: 0/1, default 1. Set 0 to use the native draft. Not sensitive.
+    "VLLM_ASCEND_MEGAKERNEL_MTP": lambda: int(os.getenv("VLLM_ASCEND_MEGAKERNEL_MTP", "1")),
+    # Timing-oriented NPU profiling: 0/1, default 0 preserves full profiling.
+    # 1 disables AIC counters and module/stack recording; keeps task timing/flows.
+    # Not sensitive.
+    "VLLM_ASCEND_PROFILER_LIGHTWEIGHT": lambda: int(os.getenv("VLLM_ASCEND_PROFILER_LIGHTWEIGHT", "0")),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
