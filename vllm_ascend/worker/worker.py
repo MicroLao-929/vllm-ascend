@@ -856,6 +856,15 @@ class NPUWorker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        # Match the upstream GPU worker: startup may use many Torch CPU
+        # threads for loading, while serving should use the runtime policy.
+        # Older supported vLLM releases do not expose this helper yet.
+        try:
+            from vllm.utils.torch_utils import set_torch_threads_for_runtime
+        except ImportError:
+            pass
+        else:
+            set_torch_threads_for_runtime()
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
             # `encoder_compilation_time` was added after v0.19.1 (vLLM #39240); fall

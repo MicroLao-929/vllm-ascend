@@ -1419,6 +1419,7 @@ class TestNPUWorker(TestBase):
         with (
             patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
             patch.object(kw_module, "kernel_warmup") as mock_kernel_warmup,
+            patch("vllm.utils.torch_utils.set_torch_threads_for_runtime", create=True) as mock_runtime_threads,
         ):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
@@ -1455,6 +1456,7 @@ class TestNPUWorker(TestBase):
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
             mock_kernel_warmup.assert_called_once_with(worker)
+            mock_runtime_threads.assert_called_once_with()
 
     @patch("vllm_ascend.worker.worker.set_random_seed")
     @patch("vllm_ascend.worker.worker.get_current_hardware_profile")
@@ -1485,6 +1487,7 @@ class TestNPUWorker(TestBase):
         with (
             patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
             patch.object(kw_module, "kernel_warmup") as mock_kernel_warmup,
+            patch("vllm.utils.torch_utils.set_torch_threads_for_runtime", create=True) as mock_runtime_threads,
         ):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
@@ -1515,6 +1518,32 @@ class TestNPUWorker(TestBase):
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
             mock_kernel_warmup.assert_called_once_with(worker)
+            mock_runtime_threads.assert_called_once_with()
+
+    def test_runtime_threads_compatible_with_older_vllm(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = MagicMock()
+        worker.model_config = SimpleNamespace(enforce_eager=True, seed=0)
+        worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=1024)
+        worker.vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(compile_sizes=[], compilation_time=0.0)
+        )
+        profile = MagicMock()
+        profile.supports.return_value = False
+        # Older vLLM has no runtime thread helper; the warmup must still finish.
+        with (
+            patch.object(kw_module, "kernel_warmup"),
+            patch("vllm_ascend.worker.worker.get_current_hardware_profile", return_value=profile),
+            patch("vllm_ascend.worker.worker.get_ascend_config", return_value=SimpleNamespace(enable_cpu_binding=False)),
+            patch("vllm_ascend.worker.worker.set_random_seed") as seed,
+            patch.dict("sys.modules", {"vllm.utils.torch_utils": SimpleNamespace()}),
+        ):
+            result = worker.compile_or_warm_up_model()
+        seed.assert_called_once_with(0)
+        self.assertEqual(result.language_model, 0.0)
+        self.assertEqual(result.encoder, 0.0)
 
     @patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized")
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
