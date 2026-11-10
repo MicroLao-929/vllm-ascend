@@ -7,7 +7,7 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
-from vllm.v1.outputs import SamplerOutput
+from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
@@ -264,6 +264,58 @@ class AscendRejectionSampler(RejectionSampler):
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
         )
+
+    def _get_logprobs_tensors(
+        self,
+        max_num_logprobs: int,
+        metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        bonus_logits: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        cu_num_sampled_tokens = torch.zeros_like(metadata.cu_num_sampled_tokens)
+        cu_num_sampled_tokens[1:] = metadata.cu_num_sampled_tokens[:-1]
+
+        # Collect target and bonus logits.
+        bonus_logits_indices = metadata.bonus_logits_indices
+        target_logits_indices = metadata.target_logits_indices
+        final_logits = torch.zeros_like(logits, dtype=torch.float32)
+        final_logits[target_logits_indices] = target_logits.to(torch.float32)
+        final_logits[bonus_logits_indices] = bonus_logits.to(torch.float32)
+
+        # NOTE: To avoid cpu-gpu synchronization, we now simply compute indices for
+        # all draft tokens, including the rejected ones. The rejected tokens will
+        # be filtered out in the `parse_output`.
+        logit_start_indices = cu_num_sampled_tokens
+        offsets = torch.arange(
+            sampled_token_ids.shape[-1],
+            device=logit_start_indices.device,
+            dtype=logit_start_indices.dtype,
+        )
+        accepted_logit_indices = (
+            logit_start_indices.unsqueeze(1) + offsets.unsqueeze(0)
+        ).flatten()
+        accepted_logit_indices.clamp_(max=final_logits.shape[0] - 1)
+        accepted_tokens = sampled_token_ids.clone().flatten()
+        # A boolean indexed assignment invokes NonzeroV2 on NPU and waits
+        # for its dynamic output size. Keep this fixed-shape update on device.
+        # Replace rejected token ids with 0 to avoid gather_logprobs error.
+        accepted_tokens.masked_fill_(accepted_tokens == PLACEHOLDER_TOKEN_ID, 0)
+
+        # Compute logprobs for accepted tokens.
+        accepted_logits = final_logits[accepted_logit_indices]
+        accepted_logprobs = (
+            accepted_logits
+            if self.is_logits_logprobs_mode
+            else self.sampler.compute_logprobs(accepted_logits)
+        )
+        return self.sampler.gather_logprobs(
+            accepted_logprobs,
+            max_num_logprobs,
+            accepted_tokens.to(torch.int64),
+        )
+
 
     def _log_rejection_sampler_entry(
         self,

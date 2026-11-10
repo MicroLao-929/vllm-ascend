@@ -933,3 +933,53 @@ class TestEntropyVerify(TestBase):
         assert output_token_ids[0, 0].item() == 1
         assert output_token_ids[0, 1].item() in (0, 88)
         assert output_token_ids[0, 2].item() == 100
+
+
+class TestLogprobsPlaceholderMask(TestBase):
+    def test_matches_upstream_for_rejected_and_accepted_tokens(self):
+        from types import SimpleNamespace
+
+        from vllm.v1.sample.rejection_sampler import RejectionSampler
+        from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
+
+        # Two ragged requests: three target/bonus rows and two target/bonus rows.
+        metadata = SimpleNamespace(
+            cu_num_sampled_tokens=torch.tensor([3, 5], dtype=torch.int32),
+            target_logits_indices=torch.tensor([0, 1, 3], dtype=torch.int64),
+            bonus_logits_indices=torch.tensor([2, 4], dtype=torch.int64),
+        )
+        for dtype in (torch.float32, torch.bfloat16):
+            logits = torch.arange(35, dtype=torch.float32).reshape(5, 7).to(dtype) / 10
+            target = logits[metadata.target_logits_indices]
+            bonus = logits[metadata.bonus_logits_indices]
+            for is_logits_mode in (False, True):
+                for ids in (
+                    [[1, 2, 3], [4, 5, 6]],
+                    [[1, 2, -1], [4, -1, -1]],
+                    [[-1, -1, -1], [-1, -1, -1]],
+                ):
+                    tokens = torch.tensor(ids, dtype=torch.int32)
+                    snapshot = tokens.clone()
+                    gathered = []
+
+                    def gather(logprobs, count, sampled):
+                        gathered.append((logprobs.clone(), count, sampled.clone()))
+                        return gathered[-1]
+
+                    sampler = SimpleNamespace(
+                        compute_logprobs=lambda x: torch.log_softmax(x, dim=-1),
+                        gather_logprobs=gather,
+                    )
+                    owner = SimpleNamespace(sampler=sampler, is_logits_logprobs_mode=is_logits_mode)
+                    expected = RejectionSampler._get_logprobs_tensors(
+                        owner, 2, metadata, logits, target, bonus, tokens
+                    )
+                    actual = AscendRejectionSampler._get_logprobs_tensors(
+                        owner, 2, metadata, logits, target, bonus, tokens
+                    )
+                    self.assertTrue(torch.equal(actual[0], expected[0]))
+                    self.assertEqual(actual[1], expected[1])
+                    self.assertTrue(torch.equal(actual[2], expected[2]))
+                    self.assertTrue(torch.equal(tokens, snapshot))
+                    self.assertEqual(actual[2].dtype, torch.int64)
+                    self.assertTrue(torch.all(actual[2] >= 0))
