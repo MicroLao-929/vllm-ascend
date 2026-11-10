@@ -95,6 +95,34 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(bridge.forward(torch.arange(8), torch.arange(8)), "mega")
         bridge._forward_mega.assert_called_once()
 
+    def test_rope_gather_updates_only_active_rows(self):
+        model = next(
+            node for node in TREE.body
+            if isinstance(node, ast.ClassDef) and node.name == "AscendGlm52MegaForCausalLM"
+        )
+        method = next(
+            node for node in model.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_fill_rope_caches"
+        )
+        namespace = {"torch": torch}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(SOURCE), "exec",
+                     flags=__future__.annotations.compiler_flag), namespace)
+
+        compact = torch.arange(64, dtype=torch.float32).reshape(8, 8) / 7
+        cos, sin = compact.chunk(2, dim=-1)
+        state = SimpleNamespace(
+            mla_cos_table=cos.bfloat16().repeat(1, 2),
+            mla_sin_table=sin.bfloat16().repeat(1, 2),
+            mla_cos_cache=torch.full((4, 8), -1, dtype=torch.bfloat16),
+            mla_sin_cache=torch.full((4, 8), -1, dtype=torch.bfloat16),
+        )
+        positions = torch.tensor([6, 2, 6])
+        namespace["_fill_rope_caches"](None, state, positions, positions.numel())
+        cos, sin = compact.index_select(0, positions).chunk(2, dim=-1)
+        for result, expected in ((state.mla_cos_cache, cos), (state.mla_sin_cache, sin)):
+            torch.testing.assert_close(result[:3], expected.repeat(1, 2).bfloat16(), rtol=0, atol=0)
+            self.assertTrue((result[3] == -1).all())
+
     def test_private_forward_copies_only_actual_tokens(self):
         original = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "AscendGlm52MegaForCausalLM")
         method = next(n for n in original.body if isinstance(n, ast.FunctionDef) and n.name == "_forward_mega")

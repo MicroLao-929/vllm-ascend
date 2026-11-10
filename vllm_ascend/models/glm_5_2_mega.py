@@ -266,6 +266,12 @@ class _MegaKernelGLM52State:
             dtype=torch.bfloat16,
             device="npu",
         )
+        # Expand the position table once, so each verify can gather directly
+        # into its stable graph buffers. Position IDs are bounded by max_model_len.
+        mla_rope = vllm_model.model.layers[0].self_attn.rotary_emb.cos_sin_cache
+        cos, sin = mla_rope[:vllm_config.model_config.max_model_len].chunk(2, dim=-1)
+        self.mla_cos_table = cos.to(self.mla_cos_cache.dtype).repeat(1, 2)
+        self.mla_sin_table = sin.to(self.mla_sin_cache.dtype).repeat(1, 2)
         # Per-batch-size persistent metadata buffers (stable addresses).
         self.meta_buffers: Dict[int, Dict[str, torch.Tensor]] = {}
 
@@ -808,11 +814,8 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
             if errors:
                 raise errors[0]
             self._mega_state = result["state"]
-            # Drain the NPU stream: the weight loader enqueues a large number
-            # of expert npu_format_cast kernels asynchronously.  The first
-            # decode step syncs the stream inside compute_graph_cache_key
-            # (int(q_seq_len)); if those kernels are still in flight, the
-            # sync hits the AICPU timeout.  Force completion here instead.
+            # Initialization enqueues weight layout conversion and RoPE table
+            # preparation on the loader thread. Drain that work before decode.
             if torch.npu.is_available():
                 torch.npu.synchronize()
             logger.info("[MegaKernel] GLM-5.2 mega kernel ready")
@@ -928,7 +931,7 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
     def _fill_rope_caches(
         self, state: _MegaKernelGLM52State, positions: torch.Tensor, num_tokens: int
     ) -> None:
-        """Populate the persistent MLA/indexer RoPE caches for this step.
+        """Gather the MLA RoPE rows into the persistent graph inputs.
 
         vLLM stores per-position cos/sin as [B, rotary_dim//2] pair
         coefficients (interleaved rope, is_neox_style=False).  MegaKernel's
@@ -940,12 +943,11 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         if num_tokens <= 0:
             return
 
-        rope = self.model.layers[0].self_attn.rotary_emb
-        cache = rope.cos_sin_cache
-        selected = cache.index_select(0, positions[:num_tokens].long())
-        cos, sin = selected.chunk(2, dim=-1)
-        state.mla_cos_cache[:num_tokens].copy_(cos.repeat(1, 2))
-        state.mla_sin_cache[:num_tokens].copy_(sin.repeat(1, 2))
+        indices = positions[:num_tokens]
+        torch.index_select(state.mla_cos_table, 0, indices,
+                           out=state.mla_cos_cache[:num_tokens])
+        torch.index_select(state.mla_sin_table, 0, indices,
+                           out=state.mla_sin_cache[:num_tokens])
 
         # The indexer uses absolute positions to read vLLM's full
         # ``state.index_cos_sin_cache``.  Do not build a per-token table here:
@@ -980,61 +982,29 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         seq_lens = getattr(req, "seq_lens", None)
         block_table = getattr(req, "block_table", None)
         slot_mapping = getattr(req, "slot_mapping", None)
-        query_start_loc = getattr(req, "query_start_loc", None)
         if seq_lens is None or block_table is None:
             raise RuntimeError(
                 "MegaKernel: attention metadata lacks required fields "
                 f"({type(attn_meta).__name__}): "
                 f"seq_lens={seq_lens is not None}, "
                 f"block_table={block_table is not None}, "
-                f"slot_mapping={slot_mapping is not None}, "
-                f"query_start_loc={query_start_loc is not None}"
+                f"slot_mapping={slot_mapping is not None}"
             )
         batch_size = int(seq_lens.shape[0])
         bufs = state.get_meta_buffers(batch_size)
 
-        # Fill the persistent MLA/indexer RoPE caches for this step.
-        self._fill_rope_caches(state, positions, num_tokens)
-
-        # ── Copy per-step inputs into persistent buffers (stable addresses) ──
-        ids = input_ids.to(torch.int64).contiguous()
-        pos = positions.to(torch.int64).contiguous()
-        bufs["input_ids"][:num_tokens].copy_(ids[:num_tokens])
-        bufs["positions"][:num_tokens].copy_(pos[:num_tokens])
-
-        # MegaKernel's scatter_update ABI requires int64 indices.  vLLM's
-        # attention metadata may expose int32 slot mappings, so normalize
-        # before copying into the stable graph buffer.
-        slot = slot_mapping.to(torch.int64).reshape(-1).contiguous()
-        bufs["slot_mapping"][:num_tokens].copy_(slot[:num_tokens])
-
-        block_table = block_table.to(torch.int32).contiguous()
-        max_blocks = min(block_table.shape[1], self._mega_state.num_blocks)
-        bufs["block_tables"][:, :max_blocks].copy_(
-            block_table[:, :max_blocks]
-        )
-
-        seq_lens = seq_lens.to(torch.int32).contiguous()
+        # copy_ casts directly into the persistent graph buffers.
+        bufs["input_ids"][:num_tokens].copy_(input_ids[:num_tokens])
+        position_buffer = bufs["positions"][:num_tokens]
+        position_buffer.copy_(positions[:num_tokens])
+        self._fill_rope_caches(state, position_buffer, num_tokens)
+        bufs["slot_mapping"][:num_tokens].copy_(slot_mapping.reshape(-1)[:num_tokens])
+        max_blocks = min(block_table.shape[1], state.num_blocks)
+        bufs["block_tables"][:, :max_blocks].copy_(block_table[:, :max_blocks])
         bufs["kv_seq_len"][:batch_size].copy_(seq_lens[:batch_size])
-        # q_seq_len per sequence derived from query_start_loc (works for both
-        # prefill and decode batches).
-        qsl_t = query_start_loc
-        if qsl_t is None:
-            qsl_t = getattr(attn_meta, "cum_query_lens", None)
-        if qsl_t is None:
-            # Fall back to per-token q_seq_len = 1 (decode-only assumption).
-            bufs["q_seq_len"][:batch_size].fill_(1)
-        else:
-            qsl = qsl_t.to(torch.int64).contiguous()
-            if qsl.shape[0] >= batch_size + 1:
-                q_seq = qsl[1 : batch_size + 1] - qsl[:batch_size]
-            elif qsl.shape[0] == batch_size:
-                # AscendSFA cum_query_lens stores prefix ends without a
-                # leading zero, including multi-token speculative verify.
-                q_seq = torch.cat((qsl[:1], qsl[1:] - qsl[:-1]))
-            else:
-                raise RuntimeError("MegaKernel: query lengths do not match request batch")
-            bufs["q_seq_len"][:batch_size].copy_(q_seq.to(torch.int32))
+        # _supports_mega_batch has already checked that these query rows are
+        # unpadded and rectangular, including the single-request case.
+        bufs["q_seq_len"][:batch_size].fill_(num_tokens // batch_size)
 
         fbi = state.build_forward_batch_info(attn_meta, bufs, num_tokens)
         debug = self._get_mega_debug()
