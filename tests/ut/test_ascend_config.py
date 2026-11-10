@@ -173,6 +173,24 @@ class TestAscendConfig(TestBase):
         self.assertTrue(config.is_sparse_li_c8_layer("model.layers.3.self_attn.indexer.k_cache"))
         self.assertFalse(config.is_sparse_li_c8_layer("model.layers.4.self_attn.indexer.k_cache"))
 
+    def test_sparse_li_c8_layer_filter_accepts_fp8_dynamic(self):
+        config = self._make_sparse_li_c8_config({
+            "model.layers.6.self_attn.indexer.quant_type": "FP8_DYNAMIC",
+            "model.layers.7.self_attn.indexer.quant_type": "BF16",
+        })
+        self.assertTrue(config.is_sparse_li_c8_layer("model.layers.6.self_attn.indexer.k_cache"))
+        self.assertFalse(config.is_sparse_li_c8_layer("model.layers.7.self_attn.indexer.k_cache"))
+
+    def test_sparse_li_c8_layer_filter_accepts_dotted_projection_key(self):
+        config = self._make_sparse_li_c8_config({
+            "model.layers.0.self_attn.indexer.wq_b.weight": "W8A8_MXFP8",
+            "model.layers.6.self_attn.indexer.quant_type": "FP8_DYNAMIC",
+            "model.layers.7.self_attn.indexer.wq_b.weight": "FLOAT",
+        })
+        self.assertTrue(config.is_sparse_li_c8_layer("model.layers.0.self_attn.indexer.k_cache"))
+        self.assertTrue(config.is_sparse_li_c8_layer("model.layers.6.self_attn.indexer.k_cache"))
+        self.assertFalse(config.is_sparse_li_c8_layer("model.layers.7.self_attn.indexer.k_cache"))
+
     def test_sparse_li_c8_without_layer_metadata_applies_to_all_indexers(self):
         config = self._make_sparse_li_c8_config({"indexer_quant_type": "INT8_DYNAMIC"})
 

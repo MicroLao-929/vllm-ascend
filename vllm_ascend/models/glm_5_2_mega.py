@@ -462,7 +462,10 @@ class _MegaKernelGLM52State:
                 "MegaKernel: cannot locate vLLM decoder layers for shared KV cache"
             )
 
-        from blockrt.models.glm_5_2.vllm_handoff import alias_vllm_cache_for_capture
+        from blockrt.models.glm_5_2.vllm_handoff import (
+            alias_vllm_cache_for_capture,
+            borrow_vllm_indexer_cache,
+        )
 
         main_caches: list[torch.Tensor] = []
         indexer_caches: list[torch.Tensor] = []
@@ -526,18 +529,14 @@ class _MegaKernelGLM52State:
                 )
                 continue
 
-            indexer_k = alias_vllm_cache_for_capture(indexer_cache[0])
-            indexer_caches.append(
-                indexer_k.reshape(-1, self.index_head_dim)
-            )
-            if len(indexer_cache) == 2:
-                indexer_scale_caches.append(
-                    alias_vllm_cache_for_capture(indexer_cache[1]).reshape(-1, 1)
+            try:
+                indexer_k, indexer_scale = borrow_vllm_indexer_cache(
+                    indexer_cache, self.index_head_dim, self.block_size
                 )
-            else:
-                indexer_scale_caches.append(
-                    torch.zeros((packed.shape[0] * packed.shape[1], 1), dtype=torch.float32, device=packed.device)
-                )
+            except ValueError as error:
+                raise RuntimeError(f"MegaKernel indexer cache layer {layer_id}: {error}") from error
+            indexer_caches.append(indexer_k)
+            indexer_scale_caches.append(indexer_scale)
 
         return main_caches, indexer_caches, indexer_scale_caches
 
