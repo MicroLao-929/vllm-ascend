@@ -33,6 +33,20 @@ class AscendDeepSeekMTP(DeepSeekMTP):
             hidden_states = self.rot(hidden_states)
         return super().forward(input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds, spec_step_idx)
 
+    @torch.profiler.record_function("ascend_native_mtp_local_argmax")
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy native MTP head with the same final norm and sharded argmax."""
+        model = self.model
+        current_step_idx = spec_step_idx % model.num_mtp_layers
+        layer = model.layers[str(model.mtp_start_layer_idx + current_step_idx)]
+        return model.logits_processor.get_top_tokens(
+            layer.shared_head.head, layer.shared_head(hidden_states)
+        )
+
     def _maybe_set_own_lm_head(self, loaded_weights: set[str]) -> None:
         """Expose a checkpoint-provided MTP head to the runner.
 

@@ -328,6 +328,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         with self.maybe_eager_context:
             self.model = self._get_model()
 
+        if self.method == "mtp" and self.use_local_argmax_reduction:
+            if not callable(getattr(self.model, "get_top_tokens", None)):
+                raise ValueError("Native MTP local argmax requires model.get_top_tokens()")
+            if lmhead_tp_enable():
+                raise ValueError("Native MTP local argmax does not support finegrained LM-head TP")
+            logger.info("Using native MTP local argmax for first and recurrent draft steps")
+
         if self.supports_mm_inputs:
             # Match upstream: a multimodal target can use a text-only drafter.
             try:
@@ -1183,6 +1190,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         probabilistic sampling is disabled, all-greedy, or vocab remapping
         prevents lossless probability export.
         """
+        if self.method == "mtp" and self.use_local_argmax_reduction:
+            # Honor the existing greedy-draft option in the Ascend override.
+            # Keep the original full-logits path when the option is disabled.
+            return self._greedy_sample(hidden_states), None
         if self.method in ("eagle3", "dflash", "dspark"):
             logits = self.model.logits_processor(self.model.lm_head, hidden_states)
             if not hasattr(self.model, "draft_id_to_target_id") or self.model.draft_id_to_target_id is None:
@@ -1293,6 +1304,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     ori_token_indices_to_sample,
                     is_logits=False,
                 )
+        elif self.use_local_argmax_reduction and self.method == "mtp":
+            draft_token_ids, draft_probs_step0 = self.compute_draft_token_ids(
+                sample_hidden_states, sampling_metadata
+            )
         elif get_ascend_config().enable_reduce_sample:
             if self.method in ("eagle3", "dflash", "mtp"):
                 draft_token_ids, draft_probs_step0 = self.compute_draft_token_ids(
@@ -1527,7 +1542,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
             draft_probs_step: torch.Tensor | None = None
-            if get_ascend_config().enable_reduce_sample:
+            if self.use_local_argmax_reduction and self.method == "mtp":
+                draft_token_ids, draft_probs_step = self.compute_draft_token_ids(
+                    sample_hidden_states, sampling_metadata
+                )
+            elif get_ascend_config().enable_reduce_sample:
                 if self.method in ("eagle3", "dflash", "dspark", "mtp"):
                     draft_token_ids, draft_probs_step = self.compute_draft_token_ids(
                         sample_hidden_states, sampling_metadata
