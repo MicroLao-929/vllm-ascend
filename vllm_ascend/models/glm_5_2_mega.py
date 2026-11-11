@@ -1000,28 +1000,13 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         batch_size = int(seq_lens.shape[0])
         bufs = state.get_meta_buffers(batch_size)
 
-        # copy_ casts directly into the persistent graph buffers.
-        bufs["input_ids"][:num_tokens].copy_(input_ids[:num_tokens])
-        position_buffer = bufs["positions"][:num_tokens]
-        position_buffer.copy_(positions[:num_tokens])
-        self._fill_rope_caches(state, position_buffer, num_tokens)
-        bufs["slot_mapping"][:num_tokens].copy_(slot_mapping.reshape(-1)[:num_tokens])
-        max_blocks = min(block_table.shape[1], state.num_blocks)
-        bufs["block_tables"][:, :max_blocks].copy_(block_table[:, :max_blocks])
-        bufs["kv_seq_len"][:batch_size].copy_(seq_lens[:batch_size])
-        # _supports_mega_batch has already checked that these query rows are
-        # unpadded and rectangular, including the single-request case.
-        bufs["q_seq_len"][:batch_size].fill_(num_tokens // batch_size)
-
-        fbi = state.build_forward_batch_info(attn_meta, bufs, num_tokens)
+        short_indices = None
         if (
             state.enable_short_context
             and batch_size == 1
             and num_tokens == 8
             and getattr(getattr(attn_meta, "attn_state", None), "name", None) == "SpecDecoding"
         ):
-            # Synchronous SFA metadata exposes the same lengths on CPU. The
-            # selection needs no device readback and excludes the top-k boundary.
             cpu_lengths = getattr(req, "seq_lens_cpu", None)
             topk = state.model_args.index_topk
             if (
@@ -1030,14 +1015,46 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
                 and cpu_lengths.numel() == 1
                 and num_tokens <= int(cpu_lengths.item()) < topk
             ):
-                from .short_context_indices import write_short_context_indices
-
                 if state.short_context_indices is None:
                     state.short_context_indices = torch.empty(
                         (1, num_tokens, 1, topk), dtype=torch.int32, device=input_ids.device,
                     )
-                write_short_context_indices(bufs["kv_seq_len"], state.short_context_indices)
-                fbi.short_context_indices = state.short_context_indices
+                short_indices = state.short_context_indices
+
+        max_blocks = min(block_table.shape[1], state.num_blocks)
+        preparation_inputs = (input_ids, positions, slot_mapping, block_table, seq_lens)
+        use_fused = (
+            short_indices is not None
+            and input_ids.device.type == "npu" and input_ids.ndim == 1 and positions.ndim == 1
+            and state.mla_cos_cache.shape[-1] == 64
+            and all(t is not None and t.device == input_ids.device
+                    and t.is_contiguous() for t in preparation_inputs)
+        )
+        if use_fused:
+            from .fused_short_prepare import prepare_q8
+
+            outputs = (
+                bufs["input_ids"], bufs["positions"], bufs["slot_mapping"], bufs["block_tables"],
+                bufs["kv_seq_len"], bufs["q_seq_len"], state.mla_cos_cache, state.mla_sin_cache,
+                short_indices,
+            )
+            prepare_q8(*preparation_inputs, state.mla_cos_table, state.mla_sin_table, outputs, max_blocks)
+        else:
+            bufs["input_ids"][:num_tokens].copy_(input_ids[:num_tokens])
+            position_buffer = bufs["positions"][:num_tokens]
+            position_buffer.copy_(positions[:num_tokens])
+            self._fill_rope_caches(state, position_buffer, num_tokens)
+            bufs["slot_mapping"][:num_tokens].copy_(slot_mapping.reshape(-1)[:num_tokens])
+            bufs["block_tables"][:, :max_blocks].copy_(block_table[:, :max_blocks])
+            bufs["kv_seq_len"][:batch_size].copy_(seq_lens[:batch_size])
+            bufs["q_seq_len"][:batch_size].fill_(num_tokens // batch_size)
+            if short_indices is not None:
+                from .short_context_indices import write_short_context_indices
+
+                write_short_context_indices(bufs["kv_seq_len"], short_indices)
+
+        fbi = state.build_forward_batch_info(attn_meta, bufs, num_tokens)
+        fbi.short_context_indices = short_indices
         debug = self._get_mega_debug()
         from contextlib import nullcontext
 
