@@ -274,6 +274,13 @@ class _MegaKernelGLM52State:
         self.mla_sin_table = sin.to(self.mla_sin_cache.dtype).repeat(1, 2)
         # Per-batch-size persistent metadata buffers (stable addresses).
         self.meta_buffers: Dict[int, Dict[str, torch.Tensor]] = {}
+        self.short_context_indices: torch.Tensor | None = None
+        self.enable_short_context = (
+            os.getenv("MK_GLM52_SHORT_CONTEXT_INDEXER", "0") == "1"
+            and self.model_args.indexer_native_c8
+            and self.model_args.index_topk == 2048
+            and vllm_config.scheduler_config.async_scheduling is False
+        )
 
         # TP rank/world are set once on the model in
         # AscendGlm52MegaForCausalLM.__init__ (SHMEM is initialized there too,
@@ -1007,6 +1014,30 @@ class AscendGlm52MegaForCausalLM(GlmMoeDsaForCausalLM):
         bufs["q_seq_len"][:batch_size].fill_(num_tokens // batch_size)
 
         fbi = state.build_forward_batch_info(attn_meta, bufs, num_tokens)
+        if (
+            state.enable_short_context
+            and batch_size == 1
+            and num_tokens == 8
+            and getattr(getattr(attn_meta, "attn_state", None), "name", None) == "SpecDecoding"
+        ):
+            # Synchronous SFA metadata exposes the same lengths on CPU. The
+            # selection needs no device readback and excludes the top-k boundary.
+            cpu_lengths = getattr(req, "seq_lens_cpu", None)
+            topk = state.model_args.index_topk
+            if (
+                isinstance(cpu_lengths, torch.Tensor)
+                and cpu_lengths.device.type == "cpu"
+                and cpu_lengths.numel() == 1
+                and num_tokens <= int(cpu_lengths.item()) < topk
+            ):
+                from .short_context_indices import write_short_context_indices
+
+                if state.short_context_indices is None:
+                    state.short_context_indices = torch.empty(
+                        (1, num_tokens, 1, topk), dtype=torch.int32, device=input_ids.device,
+                    )
+                write_short_context_indices(bufs["kv_seq_len"], state.short_context_indices)
+                fbi.short_context_indices = state.short_context_indices
         debug = self._get_mega_debug()
         from contextlib import nullcontext
 
