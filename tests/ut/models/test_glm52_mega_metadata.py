@@ -135,8 +135,8 @@ class MetadataTests(unittest.TestCase):
             slot_mapping=torch.full((10,), -1, dtype=torch.int64),
             block_tables=torch.zeros((1, 1), dtype=torch.int32),
             kv_seq_len=torch.zeros(1, dtype=torch.int32), q_seq_len=torch.zeros(1, dtype=torch.int32))
-        state = SimpleNamespace(num_blocks=1, set_kv_rope_layout=Mock(),
-            get_meta_buffers=lambda size: buffers, build_forward_batch_info=lambda *args: None,
+        state = SimpleNamespace(num_blocks=1, set_kv_rope_layout=Mock(), enable_short_context=False,
+            get_meta_buffers=lambda size: buffers, build_forward_batch_info=lambda *args: SimpleNamespace(),
             mega=SimpleNamespace(forward=lambda info, ids, *args: ids.clone()))
         model = SimpleNamespace(vllm_config=None, _mega_state=state, _ensure_mega=lambda config: state,
             _fill_rope_caches=lambda *args: None, _get_mega_debug=lambda: None)
