@@ -1,0 +1,25 @@
+--- a/glm53_mk_ep.py
++++ b/glm53_mk_ep.py
+@@ -325,0 +326,3 @@
++        sync = getattr(self, "local_dp_sync", None)
++        if sync is not None:
++            sync.arm(self.gate.sequence, active)
+@@ -358,0 +362,3 @@
++            sync = getattr(self, "local_dp_sync", None)
++            if sync is not None:
++                sync.close()
+@@ -515,0 +522,2 @@
++    bootstrap_gate = gate
++    dp_sync_mode = os.getenv("MK_GLM53_LOCAL_DP_SYNC", "off").strip().lower() if enabled else "off"
+@@ -517 +525 @@
+-                                   other, shared, capacity, compact, batched, clear_on_switch, ipc))
++                                   other, shared, capacity, compact, batched, clear_on_switch, ipc, dp_sync_mode))
+@@ -568,0 +577,8 @@
++    if dp_sync_mode != "off":
++        from vllm_ascend.worker.glm53_mk_local_dp_sync import make_sync
++        from vllm_ascend.worker.glm53_mk_tp_control import LocalTPControl
++        try:
++            hook.local_dp_sync = make_sync(dp_sync_mode, bootstrap_gate, runner, topology, ipc, LocalTPControl.connect)
++        except Exception:
++            hook.close()
++            raise

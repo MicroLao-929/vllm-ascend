@@ -1,0 +1,30 @@
+{
+  "glm53_mk_ep.py": {
+    "09f53e32d3f5e0765f2257b03ee360767738284d4f46b6ecdbcb93e2748ad947": [
+      "strict-glm53_mk_ep.py.diff",
+      "987c2db9e11c940f20f6cc2c3290ac4a7d7a2173ce55d32f3b12ecec026fcd51"
+    ],
+    "23aec082a7da8ec98f055e7566c92b775304a4edce2bcb75c393bb523be41530": [
+      "lazy-glm53_mk_ep.py.diff",
+      "05cd9dae87a9a3f7a04a503139dc97b42b315315e92d5773a381c771baf8f65d"
+    ]
+  },
+  "model_runner_v1.py": {
+    "3732111b11d518bba35f454879625b811176ca07965a19d0fbda9a429ff36de6": [
+      "strict-model_runner_v1.py.diff",
+      "c0c3aeaddb8278b825438d25ed293cb1555fa99eb136bac2ef6eb7fe05ed7b5b"
+    ],
+    "6ba5430d0764d089c95f059587f5f723b7905bd2946d980820925ef9948ee950": [
+      "lazy-stock-model_runner_v1.py.diff",
+      "235031f4f2a970329f421e86a35a3904f2068d4ce36531773bbf1e02893f050b"
+    ],
+    "cb60238318d91fd2fb153ba734e1911a26011a5b5a24aaa4845f5d03b6f2563d": [
+      "strict-stock-model_runner_v1.py.diff",
+      "b25c3b3dc154d4fe8c9d4459e431ce23fbd94f4ef1f11230a0c0bb52ead85376"
+    ],
+    "d9215f8cc157a6826cad4743676d7679d9ea7fcc60002c3aa571006c655c2c10": [
+      "lazy-model_runner_v1.py.diff",
+      "9b6f7d36078e0c4e324bb9f662f5629289e8801df8b855d01c868635cee8051a"
+    ]
+  }
+}

@@ -13,6 +13,27 @@ RECIPE = Path(__file__).resolve().parent
 PIN = "cd87230b21d74bbc1958dacd57d3b496da6f8919"
 
 
+
+def install_local_dp_sync(dest):
+    candidate = RECIPE / "local_dp_sync"
+    versions = json.loads((candidate / "versions.json").read_text())
+    for filename, variants in versions.items():
+        worker = dest / "worker" / filename
+        signature = hashlib.sha256(worker.read_bytes()).hexdigest()
+        if signature not in variants:
+            raise ValueError(f"Unsupported DP8 local-sync worker: {filename} at {signature}")
+        patch, expected = variants[signature]
+        with (candidate / patch).open("rb") as source:
+            subprocess.run(["patch", "--quiet", "--batch", "--fuzz=0", str(worker)], stdin=source, check=True)
+        if hashlib.sha256(worker.read_bytes()).hexdigest() != expected:
+            raise ValueError(f"Unexpected DP8 local-sync result: {filename}")
+    module = candidate / "glm53_mk_local_dp_sync.py"
+    target = dest / "worker" / module.name
+    if target.exists():
+        raise FileExistsError(target)
+    shutil.copy2(module, target)
+
+
 def install_lazy_tables(dest):
     candidate = RECIPE / "lazy_tables"
     versions = json.loads((candidate / "versions.json").read_text())
@@ -33,7 +54,7 @@ def install_lazy_tables(dest):
         shutil.copy2(path, output)
 
 
-def prepare(source, output, *, lazy_tables=False):
+def prepare(source, output, *, lazy_tables=False, local_dp_sync=False):
     """Publish a complete package atomically after checking the pinned inputs."""
     source, output = source.resolve(), output.resolve()
     if output.exists():
@@ -58,6 +79,8 @@ def prepare(source, output, *, lazy_tables=False):
             shutil.copy2(path, dest / "worker" / path.name)
         if lazy_tables:
             install_lazy_tables(dest)
+        if local_dp_sync:
+            install_local_dp_sync(dest)
         os.rename(stage, output)
     return output
 
@@ -67,5 +90,6 @@ if __name__ == "__main__":
     parser.add_argument("source", type=Path, help="pinned checkout or prepared v0.30 runtime")
     parser.add_argument("output", type=Path, help="a new directory for PYTHONPATH")
     parser.add_argument("--lazy-tables", action="store_true", help="install the opt-in early-runner experiment")
+    parser.add_argument("--local-dp-sync", action="store_true", help="install the opt-in strict DP8 host metadata exchange")
     args = parser.parse_args()
-    print(prepare(args.source, args.output, lazy_tables=args.lazy_tables))
+    print(prepare(args.source, args.output, lazy_tables=args.lazy_tables, local_dp_sync=args.local_dp_sync))

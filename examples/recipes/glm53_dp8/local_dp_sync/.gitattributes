@@ -1,0 +1,2 @@
+# Preserve the SHA-256 of the version-pinned worker, including its terminal blank line.
+glm53_mk_local_dp_sync.py whitespace=-blank-at-eof

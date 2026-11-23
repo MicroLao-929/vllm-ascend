@@ -55,3 +55,7 @@ export MK_GLM53_DP8_LAZY_TABLES=1
 ```
 
 十项 CPU 回归覆盖普通解码、warmup 和 prefill、回退时机、两处原生消费者以及异常一致性。候选的八卡命中率、逐 token 一致性和 TPOT 收益均待同机 A/B；不将参考分支的 24.51% 计入本配置。默认安装仍使用上一节已测的六个 worker。
+
+## 单机 DP 元数据同步
+
+八个 DP rank 可以在连续普通 MK 解码中尝试本地交换 token 数和图模式。各步资格及原生回退条件、CPU 对照和硬件验收口径见[本地 DP 同步实验](glm53_local_dp_sync.md)。

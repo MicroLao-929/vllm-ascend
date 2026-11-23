@@ -1,0 +1,27 @@
+--- a/model_runner_v1.py
++++ b/model_runner_v1.py
+@@ -828,0 +829 @@
++        glm53_dp_step=None,
+@@ -843,4 +844,9 @@
+-        packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
+-        packed_tensor[0][self.dp_rank] = num_tokens
+-        packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+-        dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
++        sync = getattr(getattr(self, "_glm53_mk_ep", None), "local_dp_sync", None)
++        if sync is None:
++            packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
++            packed_tensor[0][self.dp_rank] = num_tokens
++            packed_tensor[1][self.dp_rank] = cudagraph_mode.value
++            dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
++        else:
++            packed_tensor = sync.packed(self, glm53_dp_step, num_tokens, cudagraph_mode.value,
++                                        is_draft_model, torch, dist.all_reduce, get_dp_group().cpu_group)
+@@ -2449,0 +2456 @@
++                    **({"glm53_dp_step": scheduler_output} if getattr(ep_hook, "local_dp_sync", None) else {}),
+@@ -3507,0 +3515 @@
++        glm53_dp_step=None,
+@@ -3570,0 +3579 @@
++                **({"glm53_dp_step": glm53_dp_step} if glm53_dp_step is not None else {}),
+@@ -4166,0 +4176,2 @@
++            **({"glm53_dp_step": True} if glm53_ep_runtime_idle and not is_profile
++               and getattr(getattr(self, "_glm53_mk_ep", None), "local_dp_sync", None) else {}),
