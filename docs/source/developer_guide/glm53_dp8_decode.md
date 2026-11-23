@@ -59,3 +59,7 @@ export MK_GLM53_DP8_LAZY_TABLES=1
 ## 单机 DP 元数据同步
 
 八个 DP rank 可以在连续普通 MK 解码中尝试本地交换 token 数和图模式。各步资格及原生回退条件、CPU 对照和硬件验收口径见[本地 DP 同步实验](glm53_local_dp_sync.md)。
+
+## 八个独立请求共同执行一次专家通信
+
+多来源配方、逐卡请求和日志验收方法及短程设备结果见[GLM-5.3 多来源 DP 解码](glm53_multi_dp.md)。

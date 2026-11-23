@@ -1,0 +1,2 @@
+# Preserve the checked worker payload SHA, including the final empty line.
+glm53_multi_dp.py whitespace=-blank-at-eof

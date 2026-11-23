@@ -1,0 +1,25 @@
+{
+  "capability": "glm53.tp1.dp8.ep8.multi_source_b1.v1",
+  "module": "6062eb352885e1bfbb0c491b6c25f8c6002c5702526dbf244fdd6a9cd8e492ed",
+  "runners": {
+    "3732111b11d518bba35f454879625b811176ca07965a19d0fbda9a429ff36de6": "deployed",
+    "cb60238318d91fd2fb153ba734e1911a26011a5b5a24aaa4845f5d03b6f2563d": "stock"
+  },
+  "workers": {
+    "glm53_dp8_control.py": {
+      "input": "7f73b5877f522eab2e440621f05a572618fe1050522bd83615447ecd6e81076a",
+      "output": "c6098a8e262c9761de86f1fd862cb165d41cedd1b4f0743742a69046a041ca8d",
+      "patch": "glm53_dp8_control.py.diff"
+    },
+    "glm53_mk_ep.py": {
+      "input": "09f53e32d3f5e0765f2257b03ee360767738284d4f46b6ecdbcb93e2748ad947",
+      "output": "fa24d7ae8a5ce451390333d0449c780f211223852a562782a9c939031e9bbbd8",
+      "patch": "glm53_mk_ep.py.diff"
+    },
+    "glm53_mk_ep_companion.py": {
+      "input": "9bb1673ebbf9f0478fe63a696dbd4f1215924f5960b7478ecd756e9486271032",
+      "output": "c5458594d8f50bc3c3fad75c85eb3016a360e31f76773560da07adea8e8a6dd0",
+      "patch": "glm53_mk_ep_companion.py.diff"
+    }
+  }
+}

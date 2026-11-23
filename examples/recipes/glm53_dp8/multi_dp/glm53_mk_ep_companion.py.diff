@@ -1,0 +1,38 @@
+--- a/glm53_mk_ep_companion.py
++++ b/glm53_mk_ep_companion.py
+@@ -57,0 +58,3 @@
++        self._multi_dp_ep_size = size
++        self._multi_dp_rank = ep_rank
++        self._multi_dp_audit = size == 8 and os.environ.get("MK_GLM53_MULTI_DP_RECEIPTS") == "1"
+@@ -83 +86,6 @@
+-        with DAGCapture(retain_op_outputs={"moe_dispatch": (2,)}) as capture:
++        if self._multi_dp_audit:
++            from blockrt.models.glm_5_3_flash import multi_dp
++            recorder = multi_dp.audit_capture(DAGCapture)
++        else:
++            recorder = DAGCapture(retain_op_outputs={"moe_dispatch": (2,)})
++        with recorder as capture:
+@@ -94,0 +103,2 @@
++        if self._multi_dp_audit:
++            multi_dp.bind_receipts(graph, capture, (layer_id,), self._multi_dp_rank)
+@@ -95,0 +106,4 @@
++
++    @property
++    def receipt_graphs(self):
++        return tuple(graph for graph, _ in self._graphs)
+@@ -121 +135 @@
+-    def run(self) -> tuple[LayerReceive, ...]:
++    def run(self, *, active_owners=None) -> tuple[LayerReceive, ...]:
+@@ -123,0 +138,7 @@
++        receive_capacity = _SEND_CAPACITY
++        if active_owners is not None:
++            from blockrt.models.glm_5_3_flash import multi_dp
++            owners = multi_dp.owner_ranks(active_owners)
++            if self._multi_dp_ep_size != multi_dp.RANKS or self._multi_dp_rank in owners:
++                raise ValueError("An idle multi-source companion cannot be a real owner")
++            receive_capacity *= len(owners)
+@@ -132,2 +153,2 @@
+-                if not 0 <= rows <= _SEND_CAPACITY:
+-                    raise RuntimeError(f"Layer {layer_id} received {rows} rows from one B1 source")
++                if not 0 <= rows <= receive_capacity:
++                    raise RuntimeError(f"Layer {layer_id} received {rows} rows outside [0, {receive_capacity}]")

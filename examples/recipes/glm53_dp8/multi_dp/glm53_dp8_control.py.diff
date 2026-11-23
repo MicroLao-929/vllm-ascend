@@ -1,0 +1,7 @@
+--- a/glm53_dp8_control.py
++++ b/glm53_dp8_control.py
+@@ -248 +248,3 @@
+-            return self.gather(phase, error)
++            errors = self.gather(phase, error)
++            _require(not any(errors), f"round {self.sequence} {phase} errors {errors}")
++            return None

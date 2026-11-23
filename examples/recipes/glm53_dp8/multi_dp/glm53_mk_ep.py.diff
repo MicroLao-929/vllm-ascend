@@ -1,0 +1,87 @@
+--- a/glm53_mk_ep.py
++++ b/glm53_mk_ep.py
+@@ -145,0 +146 @@
++        self.multi_dp = None
+@@ -169,0 +171,5 @@
++    def observe_native(self, runner, output):
++        super().observe_native(runner, output)
++        if self.multi_dp is not None:
++            self.multi_dp.observed_native(self, runner, output)
++
+@@ -170,0 +177,2 @@
++        if self.multi_dp is not None:
++            return self.multi_dp.ready(self)
+@@ -197,0 +206,2 @@
++        if self.multi_dp is not None:
++            return self.multi_dp.forward(self, runner, output, idle, context, num_tokens, input_ids, positions)
+@@ -296,0 +307,10 @@
++def _check_runner_config(runner):
++    cfg = runner.vllm_config
++    _require(runner.model_config.enforce_eager and (runner.scheduler_config.max_num_seqs == 1 or os.getenv("MK_GLM53_MULTI_DP") == "1")
++             and runner.speculative_config is None and not runner.broadcast_pp_output
++             and not runner.use_aux_hidden_state_outputs and not runner.use_async_scheduling
++             and not runner.dynamic_eplb and cfg.kv_transfer_config is None
++             and getattr(cfg, "ec_transfer_config", None) is None,
++             "requires synchronous eager single-request VA with MTP, EPLB and KV transfer disabled")
++
++
+@@ -304,7 +324 @@
+-    cfg = runner.vllm_config
+-    _require(runner.model_config.enforce_eager and runner.scheduler_config.max_num_seqs == 1
+-             and runner.speculative_config is None and not runner.broadcast_pp_output
+-             and not runner.use_aux_hidden_state_outputs and not runner.use_async_scheduling
+-             and not runner.dynamic_eplb and cfg.kv_transfer_config is None
+-             and getattr(cfg, "ec_transfer_config", None) is None,
+-             "requires synchronous eager single-request VA with MTP, EPLB and KV transfer disabled")
++    _check_runner_config(runner)
+@@ -423,0 +438,3 @@
++    multi = enabled and os.getenv("MK_GLM53_MULTI_DP") == "1"
++    receipts = multi and os.getenv("MK_GLM53_MULTI_DP_RECEIPTS") == "1"
++    trace = multi and os.getenv("MK_GLM53_MULTI_DP_TRACE") == "1"
+@@ -425 +442 @@
+-                                   other, shared, capacity, compact, batched, clear_on_switch, ipc))
++                                   other, shared, capacity, compact, batched, clear_on_switch, ipc, multi, receipts, trace))
+@@ -453,0 +471 @@
++        _check_runner_config(runner)
+@@ -461,2 +479,21 @@
+-    gate.check("bootstrap", local_error)
+-    runtime = ExpertParallelRuntime(rank, size, endpoint)
++    try:
++        gate.check("bootstrap", local_error)
++    except Exception:
++        transport = getattr(gate, "local_control", None)
++        if transport is not None:
++            transport.close()
++        raise
++    runtime, init_error = None, None
++    try:
++        runtime = ExpertParallelRuntime(rank, size, endpoint)
++    except Exception as exc:
++        init_error = f"{type(exc).__name__}: {exc}"
++    try:
++        gate.check("runtime-init", init_error)
++    except Exception:
++        # A partially created symmetric group cannot collectively finalize.
++        # Propagate on every returning rank; worker shutdown owns failed device contexts.
++        transport = getattr(gate, "local_control", None)
++        if transport is not None:
++            transport.close()
++        raise
+@@ -465,0 +503 @@
++        _require(hook is not None, "worker constructor returned no GLM53 EP hook")
+@@ -471 +509,6 @@
+-        runtime.close()
++        try:
++            runtime.close()
++        finally:
++            transport = getattr(gate, "local_control", None)
++            if transport is not None:
++                transport.close()
+@@ -472,0 +516,7 @@
++    if multi:
++        from vllm_ascend.worker.glm53_multi_dp import load
++        try:
++            hook.multi_dp = load(hook, runner, receipts=receipts, trace=trace, synchronize=torch.npu.synchronize)
++        except Exception:
++            hook.close()
++            raise

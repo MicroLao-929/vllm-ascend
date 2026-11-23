@@ -14,6 +14,27 @@ PIN = "cd87230b21d74bbc1958dacd57d3b496da6f8919"
 
 
 
+def install_multi_dp(dest):
+    candidate = RECIPE / "multi_dp"
+    versions = json.loads((candidate / "manifest.json").read_text())
+    runner = dest / "worker" / "model_runner_v1.py"
+    if hashlib.sha256(runner.read_bytes()).hexdigest() not in versions["runners"]:
+        raise ValueError("Unsupported v0.30 GLM multi-source model runner")
+    for filename, expected in versions["workers"].items():
+        worker = dest / "worker" / filename
+        if hashlib.sha256(worker.read_bytes()).hexdigest() != expected["input"]:
+            raise ValueError(f"Unsupported multi-source input: {filename}")
+        with (candidate / expected["patch"]).open("rb") as delta:
+            subprocess.run(["patch", "--quiet", "--batch", "--fuzz=0", str(worker)], stdin=delta, check=True)
+        if hashlib.sha256(worker.read_bytes()).hexdigest() != expected["output"]:
+            raise ValueError(f"Unexpected multi-source output: {filename}")
+    module = candidate / "glm53_multi_dp.py"
+    output = dest / "worker" / module.name
+    if output.exists() or hashlib.sha256(module.read_bytes()).hexdigest() != versions["module"]:
+        raise ValueError("Unexpected multi-source worker module")
+    shutil.copy2(module, output)
+
+
 def install_local_dp_sync(dest):
     candidate = RECIPE / "local_dp_sync"
     versions = json.loads((candidate / "versions.json").read_text())
@@ -54,8 +75,10 @@ def install_lazy_tables(dest):
         shutil.copy2(path, output)
 
 
-def prepare(source, output, *, lazy_tables=False, local_dp_sync=False):
+def prepare(source, output, *, lazy_tables=False, local_dp_sync=False, multi_dp=False):
     """Publish a complete package atomically after checking the pinned inputs."""
+    if multi_dp and (lazy_tables or local_dp_sync):
+        raise ValueError("Multi-source decode owns the epoch and pre-launch barrier; use the strict adapter profile.")
     source, output = source.resolve(), output.resolve()
     if output.exists():
         raise FileExistsError(f"Output already exists: {output}")
@@ -81,6 +104,8 @@ def prepare(source, output, *, lazy_tables=False, local_dp_sync=False):
             install_lazy_tables(dest)
         if local_dp_sync:
             install_local_dp_sync(dest)
+        if multi_dp:
+            install_multi_dp(dest)
         os.rename(stage, output)
     return output
 
@@ -91,5 +116,6 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path, help="a new directory for PYTHONPATH")
     parser.add_argument("--lazy-tables", action="store_true", help="install the opt-in early-runner experiment")
     parser.add_argument("--local-dp-sync", action="store_true", help="install the opt-in strict DP8 host metadata exchange")
+    parser.add_argument("--multi-dp", action="store_true", help="install B1-per-origin GLM-5.3 multi-source decode")
     args = parser.parse_args()
-    print(prepare(args.source, args.output, lazy_tables=args.lazy_tables, local_dp_sync=args.local_dp_sync))
+    print(prepare(args.source, args.output, lazy_tables=args.lazy_tables, local_dp_sync=args.local_dp_sync, multi_dp=args.multi_dp))
