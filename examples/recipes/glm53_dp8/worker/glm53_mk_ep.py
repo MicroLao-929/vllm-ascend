@@ -1,6 +1,7 @@
 """Coordinated GLM5.3 MK decode at VA's worker forward boundary."""
 
 import builtins
+import os
 from dataclasses import dataclass
 from itertools import chain
 
@@ -392,11 +393,21 @@ def load_ep_hook(runner):
              or envs.VLLM_ASCEND_GLM53_MK_MTP)
     shared = envs.VLLM_ASCEND_GLM53_MK_NATIVE_EXPERTS
     capacity = envs.VLLM_ASCEND_GLM53_MK_MAX_CONTEXT_TOKENS if enabled else None
+    compact = tp_size == 1 and size == 8 and os.getenv("GLM53_PLAIN_COMPACT_GATE") == "1"
+    batched = os.getenv("VLLM_ASCEND_GLM53_MK_BATCH_COMPANION_READBACK") == "1"
+    clear_on_switch = os.getenv("MK_COLLECTIVE_CLEAR_ON_GRAPH_SWITCH", "0") not in ("", "0")
     voted = gate.gather("enable", (enabled, endpoint if enabled else None, path if enabled else None,
-                                   other, shared, capacity))
+                                   other, shared, capacity, compact, batched, clear_on_switch))
     _require(all(v == voted[0] for v in voted), f"inconsistent worker configuration {voted}")
     if not enabled:
         return None
+    _require(not batched or not clear_on_switch, "batched companion needs a stable collective heap")
+    if compact:
+        from vllm_ascend.worker.glm53_dp8_control import FastRoundGate, FixedCpuExchange
+        gate = FastRoundGate(
+            rank, size, exchange=FixedCpuExchange(group.cpu_group, size, FastRoundGate.MESSAGE_SIZE).exchange,
+            object_exchange=lambda item: _group_rows(group.cpu_group, size, item))
+    logger.info("GLM53 ordinary DP/EP rank=%d compact_gate=%s batched_receipts=%s", rank, compact, batched)
     ep = get_ep_group()
     local_error = None
     if (not endpoint or other or ep.world_size != size or group.world_size != size

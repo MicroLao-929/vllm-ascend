@@ -43,13 +43,15 @@ class IndexerCache:
 class _NativePages:
     ids: tuple[int, ...]
     rows_per_id: int
+    capacity: int | None = None
 
     def slot(self, row):
         page, offset = divmod(row, self.rows_per_id)
         return self.ids[page] * self.rows_per_id + offset
 
     def extends(self, previous):
-        return self.rows_per_id == previous.rows_per_id and self.ids[:len(previous.ids)] == previous.ids
+        return self is previous or (self.rows_per_id == previous.rows_per_id
+                                   and self.ids[:len(previous.ids)] == previous.ids)
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,58 @@ def _active_pages(table, count, rows_per_id, total_rows):
     return _NativePages(ids, rows_per_id)
 
 
+class _DecodeMetadata:
+    """Read and validate shared VA metadata within one decode step."""
+
+    def __init__(self):
+        self._reads = {}
+        self._pages = {}
+
+    def values(self, tensor, length, field):
+        _require(isinstance(tensor, torch.Tensor) and tensor.ndim == 1 and tensor.shape[0] == length
+                 and tensor.dtype in (torch.int32, torch.int64), f"invalid {field}")
+        return self._read(tensor, None)
+
+    def value(self, tensor, field):
+        return self.values(tensor, 1, field)[0]
+
+    def row(self, tensor, length, field):
+        _require(isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and tensor.shape[0] == 1
+                 and tensor.shape[1] >= length and tensor.dtype in (torch.int32, torch.int64),
+                 f"invalid {field}")
+        return self._read(tensor, length)
+
+    def active_pages(self, table, count, rows_per_id, total_rows, *, previous=None):
+        _require(type(rows_per_id) is int and rows_per_id > 0 and total_rows % rows_per_id == 0,
+                 "invalid VA block granularity")
+        columns = (count + rows_per_id - 1) // rows_per_id
+        key = (id(table), columns, rows_per_id, total_rows)
+        pages = self._pages.get(key)
+        if pages is None:
+            # row() retains the table for the lifetime of this identity key.
+            ids = self.row(table, columns, "VA block table")
+            capacity = total_rows // rows_per_id
+            if (previous is not None and previous.rows_per_id == rows_per_id
+                    and previous.capacity == capacity and ids == previous.ids):
+                pages = previous
+            else:
+                _require(all(0 <= page < capacity for page in ids), "VA page is out of range")
+                _require(len(set(ids)) == len(ids), "duplicate active VA page in one request")
+                pages = _NativePages(ids, rows_per_id, capacity)
+            self._pages[key] = pages
+        return pages
+
+    def _read(self, tensor, columns):
+        # Keep the source alive so its identity cannot be reused within this step.
+        key = (id(tensor), columns)
+        entry = self._reads.get(key)
+        if entry is None:
+            view = tensor if columns is None else tensor[0, :columns]
+            entry = (tensor, tuple(view.tolist()))
+            self._reads[key] = entry
+        return entry[1]
+
+
 def _copy_prefix(source, native, target, count, mk_pages, mk_page_stride):
     row = 0
     while row < count:
@@ -122,6 +176,40 @@ def _copy_prefix(source, native, target, count, mk_pages, mk_page_stride):
         target[mk_pages[mk_page * mk_page_stride], mk_offset:mk_offset + n].copy_(
             source[src_page, src_offset:src_offset + n])
         row += n
+
+
+def _copy_prefix_runs(source, native, target, count, mk_pages, mk_page_stride):
+    if not source.is_contiguous() or any(p != mk_pages[0] + i for i, p in enumerate(mk_pages)):
+        return _copy_prefix(source, native, target, count, mk_pages, mk_page_stride)
+    if not count:
+        return
+
+    # DecodePageLayout gives MK a contiguous range of physical pages. Pool
+    # rows use every fourth MK page within that range.
+    rows = source.view(-1, *source.shape[2:])
+    first_mk_page = mk_pages[0]
+    rows_per_id = native.rows_per_id
+    run_start = 0
+    for run_end in range(1, len(native.ids) + 1):
+        if run_end < len(native.ids) and native.ids[run_end] == native.ids[run_end - 1] + 1:
+            continue
+        row = run_start * rows_per_id
+        end = min(count, run_end * rows_per_id)
+        source_row = native.ids[run_start] * rows_per_id
+        while row < end:
+            logical_page, offset = divmod(row, _PAGE)
+            page = first_mk_page + logical_page * mk_page_stride
+            whole_pages = (end - row) // _PAGE if not offset else 0
+            if whole_pages:
+                n = whole_pages * _PAGE
+                payload = rows[source_row:source_row + n].view(whole_pages, _PAGE, *source.shape[2:])
+                target[page:page + whole_pages * mk_page_stride:mk_page_stride].copy_(payload)
+            else:
+                n = min(end - row, _PAGE - offset)
+                target[page, offset:offset + n].copy_(rows[source_row:source_row + n])
+            row += n
+            source_row += n
+        run_start = run_end
 
 
 def _row_cache(tensor, inner_shape, dtype, device):
@@ -237,10 +325,11 @@ class VAMKBridge:
                  "VA caches must cover the MK layers")
         metadata = context.attn_metadata
         _require(isinstance(metadata, dict), "VA bridge requires a per-layer ForwardContext metadata dict")
-        conv_states = {layer: self._kda_target(cache, metadata[cache.prefix]) for layer, cache in kda.items()}
-        mla_pages = {layer: self._mla_target(cache, metadata[cache.prefix], position) for layer, cache in mla.items()}
+        reads = _DecodeMetadata()
+        conv_states = {layer: self._kda_target(cache, metadata[cache.prefix], reads) for layer, cache in kda.items()}
+        mla_pages = {layer: self._mla_target(cache, metadata[cache.prefix], position, reads) for layer, cache in mla.items()}
         idx_addresses = {
-            layer: self._indexer_target(cache, metadata[cache.pool_prefix], metadata[cache.tail_prefix], position)
+            layer: self._indexer_target(cache, metadata[cache.pool_prefix], metadata[cache.tail_prefix], position, reads)
             for layer, cache in indexer.items()
         }
         locations = (
@@ -296,13 +385,13 @@ class VAMKBridge:
                   {layer: pages.ids[-1] for layer, pages in mla_pages.items()}, idx_addresses)
         return DecodeResult(logits, hidden, imported, reused)
 
-    def _kda_target(self, cache, metadata):
+    def _kda_target(self, cache, metadata, reads):
         _require((metadata.num_actual_tokens, metadata.num_decodes, metadata.num_decode_tokens,
                   metadata.num_prefills, metadata.num_spec_decodes) == (1, 1, 1, 0, 0)
                  and metadata.spec_sequence_masks is None
-                 and _metadata_values(metadata.non_spec_query_start_loc, 2, "KDA query boundaries") == (0, 1),
+                 and reads.values(metadata.non_spec_query_start_loc, 2, "KDA query boundaries") == (0, 1),
                  "VA KDA metadata must represent one non-speculative decode token")
-        slot = _value(metadata.non_spec_state_indices_tensor, "KDA state index")
+        slot = reads.value(metadata.non_spec_state_indices_tensor, "KDA state index")
         conv_shape = self._conv_shape[::-1] if cache.conv_dim_first else self._conv_shape
         _require(cache.conv.shape[1:] == conv_shape and cache.recurrent.shape[1:] == self._recurrent_shape
                  and cache.conv.dtype == torch.bfloat16 and cache.recurrent.dtype == torch.float32
@@ -313,7 +402,7 @@ class VAMKBridge:
             conv = conv.transpose(-1, -2)
         return conv, cache.recurrent[slot].transpose(-1, -2), slot
 
-    def _mla_target(self, cache, metadata, position):
+    def _mla_target(self, cache, metadata, position, reads):
         _row_cache(cache.latent, (1, _LATENT), torch.bfloat16, self._device)
         rows = cache.latent.shape[1]
         # The NoPE sparse MLA layer is registered with AscendSFABackend.
@@ -321,16 +410,16 @@ class VAMKBridge:
                   metadata.num_decode_tokens, metadata.num_prefills) == (1, 1, 1, 1, 0)
                  and isinstance(metadata.block_size, int) and 0 < metadata.block_size <= rows
                  and rows % metadata.block_size == 0 and metadata.sin is None and metadata.cos is None
-                 and _metadata_values(metadata.query_start_loc, 2, "MLA query boundaries") == (0, 1)
-                 and _value(metadata.seq_lens, "MLA length") == position + 1
-                 and _value(metadata.positions, "MLA decode position") == position,
+                 and reads.values(metadata.query_start_loc, 2, "MLA query boundaries") == (0, 1)
+                 and reads.value(metadata.seq_lens, "MLA length") == position + 1
+                 and reads.value(metadata.positions, "MLA decode position") == position,
                  "VA sparse NoPE MLA metadata must represent the scheduled decode token")
-        pages = _active_pages(metadata.block_table, position + 1, metadata.block_size, cache.latent.shape[0] * rows)
-        slot = _value(metadata.slot_mapping, "MLA slot")
+        pages = reads.active_pages(metadata.block_table, position + 1, metadata.block_size, cache.latent.shape[0] * rows)
+        slot = reads.value(metadata.slot_mapping, "MLA slot")
         _require(slot == pages.slot(position), "VA MLA slot disagrees with the active prefix page")
         return pages
 
-    def _indexer_target(self, cache, pool, tail, position):
+    def _indexer_target(self, cache, pool, tail, position, reads):
         _row_cache(cache.pool, (1, _INDEX), torch.bfloat16, self._device)
         _row_cache(cache.tail, (2 * _INDEX,), torch.float32, self._device)
         # The native KeyPool writer splits pooled_slot_mapping using cache.shape[1].
@@ -340,19 +429,19 @@ class VAMKBridge:
         pools, open_rows = divmod(position + 1, _RATIO)
         _require(pool.num_actual_tokens == 1 and pool.query_metadata is None
                  and pool.compress_ratio == _RATIO
-                 and _metadata_values(pool.query_start_loc, 2, "KPool query boundaries") == (0, 1)
-                 and _value(pool.positions, "KPool position") == position
-                 and _value(pool.start_pos, "KPool start") == position
-                 and _value(pool.raw_seq_lens, "KPool token length") == position + 1
-                 and _value(pool.seq_lens, "KPool compressed length") == pools
-                 and _value(pool.pool_tail, "KPool tail length") == open_rows, "invalid VA KPool decode metadata")
-        pages = _active_pages(pool.block_table, pools, rows, cache.pool.shape[0] * rows)
+                 and reads.values(pool.query_start_loc, 2, "KPool query boundaries") == (0, 1)
+                 and reads.value(pool.positions, "KPool position") == position
+                 and reads.value(pool.start_pos, "KPool start") == position
+                 and reads.value(pool.raw_seq_lens, "KPool token length") == position + 1
+                 and reads.value(pool.seq_lens, "KPool compressed length") == pools
+                 and reads.value(pool.pool_tail, "KPool tail length") == open_rows, "invalid VA KPool decode metadata")
+        pages = reads.active_pages(pool.block_table, pools, rows, cache.pool.shape[0] * rows)
         slot = pages.slot(prior_pools) if open_rows == 0 else -1
         pool_page, pool_row = divmod(slot, rows) if slot >= 0 else (None, None)
-        _require(_value(pool.slot_mapping, "KPool token slot") == slot
-                 and _value(pool.pooled_slot_mapping, "KPool compact slot") == slot, "invalid VA KPool slot")
+        _require(reads.value(pool.slot_mapping, "KPool token slot") == slot
+                 and reads.value(pool.pooled_slot_mapping, "KPool compact slot") == slot, "invalid VA KPool slot")
 
-        tail_page = _active_pages(tail.block_table, 1, 1, cache.tail.shape[0]).ids[0]
+        tail_page = reads.active_pages(tail.block_table, 1, 1, cache.tail.shape[0]).ids[0]
         cann = tail.cann_inputs
         capacity = cache.tail.shape[1]
         stride, remainder = divmod(cache.tail.stride(0), 2 * _INDEX)
@@ -360,8 +449,8 @@ class VAMKBridge:
                  and cann.page_rows == stride and capacity == tail.block_size == _RATIO
                  and cann.history_indices.shape == cann.write_indices.shape == (1, _RATIO),
                  "invalid VA non-speculative CANN tail metadata or page stride")
-        history = _metadata_values(cann.history_indices[0], _RATIO, "CANN tail history")
-        writes = _metadata_values(cann.write_indices[0], _RATIO, "CANN tail writes")
+        history = reads.row(cann.history_indices, _RATIO, "CANN tail history")
+        writes = reads.row(cann.write_indices, _RATIO, "CANN tail writes")
         base = tail_page * stride
         history_rows = tuple((position - prior_tail + row) % capacity for row in range(prior_tail))
         expected_writes = tuple(base + (position + 1 - open_rows + row) % capacity if row < open_rows else -1
@@ -376,8 +465,8 @@ class VAMKBridge:
             if self.max_context_tokens <= _PAGE:
                 self._mla[layer][_SCRATCH_PAGE].zero_()
                 self._pool[layer][_SCRATCH_PAGE].zero_()
-            _copy_prefix(mla[layer].latent, pages, self._mla[layer], position, self._page_table, 1)
-            _copy_prefix(indexer[layer].pool, idx_addresses[layer].pages, self._pool[layer],
+            _copy_prefix_runs(mla[layer].latent, pages, self._mla[layer], position, self._page_table, 1)
+            _copy_prefix_runs(indexer[layer].pool, idx_addresses[layer].pages, self._pool[layer],
                          position // _RATIO, self._page_table, _RATIO)
         return {layer: (conv.contiguous(), recurrent.contiguous()) for layer, (conv, recurrent, _) in kda.items()}
 

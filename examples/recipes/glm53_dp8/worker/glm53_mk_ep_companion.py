@@ -1,6 +1,7 @@
 """Run the local experts for an idle rank of a single-origin TP1 B1 MK decode step."""
 
 import builtins
+import os
 from dataclasses import dataclass
 
 import torch
@@ -70,6 +71,8 @@ class Glm53MKEPCompanion:
         self._stage = stage
         self._device_id = device_id
         self._failed = False
+        self._batch_readback = os.getenv("VLLM_ASCEND_GLM53_MK_BATCH_COMPANION_READBACK") == "1"
+        self._profile_settings = None
         with torch.inference_mode(False), torch.no_grad():
             self._expanded = torch.zeros((_SEND_CAPACITY, _HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
             self._cumsum = torch.zeros((_EXPERTS,), dtype=torch.int64, device=device)
@@ -100,19 +103,37 @@ class Glm53MKEPCompanion:
         if torch.npu.current_device() != self._device_id:
             raise RuntimeError("MK EP companion replay is on the wrong NPU device")
 
+    def _receive_counts(self, replay_cached):
+        if replay_cached:
+            for graph, _ in self._graphs:
+                graph.run()
+            # Each graph retains a distinct cumsum. The MK completion event
+            # orders the subsequent read on the current NPU stream.
+            yield from torch.stack([cumsum[-1] for _, cumsum in self._graphs]).cpu().tolist()
+            return
+
+        for graph, local_cumsum in self._graphs:
+            graph.run()
+            # Cold or refreshed contexts upload from a shared host buffer.
+            torch.npu.synchronize()
+            yield int(local_cumsum[-1].item())
+
     def run(self) -> tuple[LayerReceive, ...]:
         """Replay in target layer order and return actual received expert rows."""
         self.check_ready()
+        profile_settings = None
+        if self._batch_readback:
+            profile_settings = tuple(os.getenv(name) for name in (
+                "ENABLE_PROFILE", "ENABLE_PROFILE_AICORE", "PROFILE_FILTER_LEVEL"))
+        replay_cached = self._batch_readback and self._profile_settings == profile_settings
         receives = []
         try:
-            for layer_id, (graph, local_cumsum) in zip(self.layer_ids, self._graphs):
-                graph.run()
-                torch.npu.synchronize()
-                rows = int(local_cumsum[-1].item())
+            for layer_id, rows in zip(self.layer_ids, self._receive_counts(replay_cached), strict=True):
                 if not 0 <= rows <= _SEND_CAPACITY:
                     raise RuntimeError(f"Layer {layer_id} received {rows} rows from one B1 source")
                 receives.append(LayerReceive(layer_id, rows))
         except Exception:
             self._failed = True
             raise
+        self._profile_settings = profile_settings
         return tuple(receives)

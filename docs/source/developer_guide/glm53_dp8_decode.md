@@ -14,3 +14,9 @@ export PYTHONPATH="$OUTPUT${PYTHONPATH:+:$PYTHONPATH}"
 八个 rank 分摊专家，每张卡保留完整注意力。原生 prefill 后，持有该请求的 rank 回放 MegaKernel 主模型，其余七个 rank 执行相应的专家层。每个 rank 复用本地原生专家权重。普通解码关闭 MTP，允许页式上下文至 2,048 token。本轮 45 层 W4A4，单请求 128 进、128 出，逐层回读版本的五次请求 TPOT 中位数为 38.955 ms；同轮原生 decode graph 为 16.829 ms。
 
 已有 v0.30 MK 工作环境中，服务的公共参数包括 `--tensor-parallel-size 1 --data-parallel-size 8 --enable-expert-parallel --max-model-len 2048 --max-num-seqs 1`。原生服务使用 `--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2]}'`。MK 服务使用 `--enforce-eager` 让 native prefill 走常规入口，decode 由 worker 内的 MK graph 捕获和回放。MK 需设置 `VLLM_ASCEND_GLM53_MK_EP=1`、`VLLM_ASCEND_GLM53_MK_NATIVE_EXPERTS=1`、`VLLM_ASCEND_GLM53_MK_MAX_CONTEXT_TOKENS=2048`、`VLLM_ASCEND_GLM53_MK_CHECKPOINT` 以及八个 rank 共用的 `VLLM_ASCEND_GLM53_MK_EP_ENDPOINT`。普通解码省略 speculative config。
+
+## 同一步元数据复用、批量读取专家计数和定长控制消息
+
+worker 在一次 decode 内复用桥接元数据，合并连续页复制，将辅助 rank 的专家计数收集到一次热回放后的回读。普通热路径的控制协议改用固定 171 字节格式；需附带异常信息或者超长请求标识时，所有 rank 通过原协议交换详情。
+
+用 `GLM53_PLAIN_COMPACT_GATE=1` 与 `VLLM_ASCEND_GLM53_MK_BATCH_COMPANION_READBACK=1` 启用这组改动。同一轮五次 128/128 请求的中位 TPOT 从 38.955 ms 降到 33.578 ms。再设置 `SCHEDULING_MODE=static` 时测得 30.418 ms。运行 `python3 tests/ut/recipes/test_glm53_dp8_control.py` 可验证所有 rank 针对普通输入、混合请求、异常、乱序和控制消息回退作出一致决定。
