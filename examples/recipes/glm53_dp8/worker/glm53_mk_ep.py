@@ -256,7 +256,12 @@ class GLM53MKEPHook(GLM53MKHook):
         return result
 
     def close(self):
-        self.runtime.close()
+        try:
+            self.runtime.close()
+        finally:
+            local = getattr(self.gate, "local_control", None)
+            if local is not None:
+                local.close()
 
 
 def _check_native_experts(parallel, layers, plan, rank):
@@ -396,17 +401,29 @@ def load_ep_hook(runner):
     compact = tp_size == 1 and size == 8 and os.getenv("GLM53_PLAIN_COMPACT_GATE") == "1"
     batched = os.getenv("VLLM_ASCEND_GLM53_MK_BATCH_COMPANION_READBACK") == "1"
     clear_on_switch = os.getenv("MK_COLLECTIVE_CLEAR_ON_GRAPH_SWITCH", "0") not in ("", "0")
+    ipc = compact and os.environ.get("GLM53_DP8_LOCAL_CONTROL") == "1"
     voted = gate.gather("enable", (enabled, endpoint if enabled else None, path if enabled else None,
-                                   other, shared, capacity, compact, batched, clear_on_switch))
+                                   other, shared, capacity, compact, batched, clear_on_switch, ipc))
     _require(all(v == voted[0] for v in voted), f"inconsistent worker configuration {voted}")
     if not enabled:
         return None
     _require(not batched or not clear_on_switch, "batched companion needs a stable collective heap")
     if compact:
         from vllm_ascend.worker.glm53_dp8_control import FastRoundGate, FixedCpuExchange
-        gate = FastRoundGate(
-            rank, size, exchange=FixedCpuExchange(group.cpu_group, size, FastRoundGate.MESSAGE_SIZE).exchange,
-            object_exchange=lambda item: _group_rows(group.cpu_group, size, item))
+        local_control = None
+        width = FastRoundGate.MESSAGE_SIZE
+        if ipc:
+            from vllm_ascend.worker.glm53_mk_tp_control import LocalTPControl
+            local_control = LocalTPControl.connect(gate, width)
+            def exchange(payload):
+                gathered = local_control.all_gather(payload)
+                return [gathered[i:i + width] for i in range(0, size * width, width)]
+        else:
+            exchange = FixedCpuExchange(group.cpu_group, size, width).exchange
+        gate = FastRoundGate(rank, size, exchange=exchange,
+                             object_exchange=lambda item: _group_rows(group.cpu_group, size, item))
+        gate.local_control = local_control
+        logger.info("GLM53 DP rank=%d local fixed-size control=%s", rank, ipc)
     logger.info("GLM53 ordinary DP/EP rank=%d compact_gate=%s batched_receipts=%s", rank, compact, batched)
     ep = get_ep_group()
     local_error = None

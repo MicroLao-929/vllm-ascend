@@ -20,3 +20,9 @@ export PYTHONPATH="$OUTPUT${PYTHONPATH:+:$PYTHONPATH}"
 worker 在一次 decode 内复用桥接元数据，合并连续页复制，将辅助 rank 的专家计数收集到一次热回放后的回读。普通热路径的控制协议改用固定 171 字节格式；需附带异常信息或者超长请求标识时，所有 rank 通过原协议交换详情。
 
 用 `GLM53_PLAIN_COMPACT_GATE=1` 与 `VLLM_ASCEND_GLM53_MK_BATCH_COMPANION_READBACK=1` 启用这组改动。同一轮五次 128/128 请求的中位 TPOT 从 38.955 ms 降到 33.578 ms。再设置 `SCHEDULING_MODE=static` 时测得 30.418 ms。运行 `python3 tests/ut/recipes/test_glm53_dp8_control.py` 可验证所有 rank 针对普通输入、混合请求、异常、乱序和控制消息回退作出一致决定。
+
+## 单机八进程控制通道
+
+在定长协议上设置 `GLM53_DP8_LOCAL_CONTROL=1`，八个 worker 用 Linux 共享内存和本地通知完成每步的选择、就绪和完成确认。初始化通过 Gloo 协商并核对网络和进程命名空间、对端 rank 身份。此项要求八个进程位于同一主机及命名空间。分机部署保留原 Gloo 配置。
+
+八进程 CPU 微基准中，每次选主和两次确认的中位时长从 Gloo 的 2.017 ms 降到 0.168 ms，包含 160 步并跳过前十步。端到端服务还包含模型计算和专家通信。运行 `python3 tests/ut/recipes/test_glm53_dp8_ipc.py` 可验证八种来源 rank 及多个来源争用时的集体决定。
