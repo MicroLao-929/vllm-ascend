@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -12,7 +13,27 @@ RECIPE = Path(__file__).resolve().parent
 PIN = "cd87230b21d74bbc1958dacd57d3b496da6f8919"
 
 
-def prepare(source, output):
+def install_lazy_tables(dest):
+    candidate = RECIPE / "lazy_tables"
+    versions = json.loads((candidate / "versions.json").read_text())
+    for name, options in versions.items():
+        worker = dest / "worker" / name
+        original = hashlib.sha256(worker.read_bytes()).hexdigest()
+        if original not in options:
+            raise ValueError(f"Unsupported worker for lazy tables: {name} at {original}")
+        version = options[original]
+        with (candidate / version["file"]).open("rb") as delta:
+            subprocess.run(["patch", "--quiet", "--batch", "--fuzz=0", str(worker)], stdin=delta, check=True)
+        if hashlib.sha256(worker.read_bytes()).hexdigest() != version["result"]:
+            raise ValueError(f"Unexpected lazy tables worker: {name}")
+    for path in sorted((candidate / "worker").glob("*.py")):
+        output = dest / "worker" / path.name
+        if output.exists():
+            raise FileExistsError(f"Unexpected existing worker: {path.name}")
+        shutil.copy2(path, output)
+
+
+def prepare(source, output, *, lazy_tables=False):
     """Publish a complete package atomically after checking the pinned inputs."""
     source, output = source.resolve(), output.resolve()
     if output.exists():
@@ -35,6 +56,8 @@ def prepare(source, output):
             if path.name not in inputs:
                 raise ValueError(f"Worker missing from base manifest: {path.name}")
             shutil.copy2(path, dest / "worker" / path.name)
+        if lazy_tables:
+            install_lazy_tables(dest)
         os.rename(stage, output)
     return output
 
@@ -43,5 +66,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="pinned checkout or prepared v0.30 runtime")
     parser.add_argument("output", type=Path, help="a new directory for PYTHONPATH")
+    parser.add_argument("--lazy-tables", action="store_true", help="install the opt-in early-runner experiment")
     args = parser.parse_args()
-    print(prepare(args.source, args.output))
+    print(prepare(args.source, args.output, lazy_tables=args.lazy_tables))

@@ -1,0 +1,112 @@
+--- glm53_mk_ep.py
++++ glm53_mk_ep.py
+@@ -145,0 +146,10 @@
++        self.native_builder_deferral = os.getenv("MK_GLM53_NATIVE_BUILDER_DEFERRAL", "off")
++        self.early_forced_miss = os.getenv("MK_GLM53_NATIVE_BUILDER_MISS")
++        self._address_builder = None
++        self._address_builder_unavailable = False
++        self._last_completed_round = None
++        self._runner_ref = None
++        self.early_runner = None
++        self.lazy_tables = os.getenv("MK_GLM53_DP8_LAZY_TABLES", "0") == "1"
++        self.lazy_table_counts = {"skipped": 0, "restored": 0}
++        self._prepared_descriptors = None
+@@ -150 +160,7 @@
+-    def _cache_descriptors(self, runner):
++    def _cache_descriptors(self, runner, *, bound_indexer=None):
++        if bound_indexer is None and self._prepared_descriptors is not None:
++            identity, descriptors = self._prepared_descriptors
++            if (identity == (self.request_id, self.next_position)
++                    and self._early_cache_bindings_match(runner, descriptors)):
++                self._prepared_descriptors = None
++                return descriptors
+@@ -161 +177 @@
+-        bound = Glm5NextKPoolIndexerBackend._bound_cache
++        bound = Glm5NextKPoolIndexerBackend._bound_cache if bound_indexer is None else bound_indexer
+@@ -168,0 +185,50 @@
++
++    def _release(self, reason):
++        super()._release(reason)
++        self._last_completed_round = None
++        self._prepared_descriptors = None
++
++    @staticmethod
++    def _early_cache_bindings_match(runner, descriptors):
++        from vllm_ascend.attention.indexer_kpool import Glm5NextKPoolIndexerBackend
++
++        kda, mla, indexer = descriptors
++        registry = runner.compilation_config.static_forward_context
++        bound = Glm5NextKPoolIndexerBackend._bound_cache
++        try:
++            for cache in kda.values():
++                owner = registry[cache.prefix]
++                conv, recurrent = owner.kv_cache
++                if (conv is not cache.conv or recurrent is not cache.recurrent
++                        or owner._conv_state_dim_first != cache.conv_dim_first):
++                    return False
++            for cache in mla.values():
++                latent, rope = registry[cache.prefix].kv_cache
++                if latent is not cache.latent or rope.shape[-1] != 0:
++                    return False
++            return all(bound(registry[cache.pool_prefix]) is cache.pool
++                       and bound(registry[cache.tail_prefix]) is cache.tail for cache in indexer.values())
++        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
++            return False
++
++    def plan_cpu_addresses(self, facts, schedule):
++        """Read and validate this step's CPU addresses before the native builder."""
++        if self._runner_ref is None or self._address_builder_unavailable:
++            raise RuntimeError("early address planning is not bound")
++        from vllm_ascend.worker.glm53_mk_step_address_plan import (
++            CpuStepAddressBuilder, UnsupportedAddressPlan, early_indexer_cache,
++        )
++        runner = self._runner_ref
++        if self._address_builder is None:
++            self._address_builder = CpuStepAddressBuilder(runner)
++        kda, mla, indexer = self._cache_descriptors(runner, bound_indexer=early_indexer_cache)
++        plan = self._address_builder.read_checked(
++            runner, schedule.position, kda, mla, indexer, scheduler_output=None)
++        addresses = self.bridge.checked_cpu_addresses(
++            schedule.position, kda, mla, indexer, plan)
++        if addresses is None:
++            raise UnsupportedAddressPlan("bridge rejected the CPU address geometry")
++        from vllm_ascend.worker.glm53_mk_early_runner import Plan
++        self._prepared_descriptors = ((schedule.request_id, schedule.position),
++                                      (kda, mla, indexer))
++        return Plan(plan.request_id, plan.position, addresses, plan)
+@@ -198,0 +265,2 @@
++        # A round is armed only after its own complete check succeeds.
++        self._last_completed_round = None
+@@ -216,0 +285 @@
++            self._materialize_early_metadata(context)
+@@ -230,0 +300,2 @@
++                if not self._early_plan_ready(runner):
++                    self._materialize_early_metadata(context)
+@@ -251,0 +323,3 @@
++        if not idle:
++            # Arm the pre-native-builder continuation for the next position.
++            self._last_completed_round = (active.request, active.position)
+@@ -257,0 +332,18 @@
++
++    def _early_plan_ready(self, runner):
++        prepared = self._prepared_descriptors
++        if prepared is None:
++            return True
++        identity, descriptors = prepared
++        return (identity == (self.request_id, self.next_position)
++                and self._early_cache_bindings_match(runner, descriptors))
++
++    def _materialize_early_metadata(self, context):
++        """Build deferred native metadata before any cache write, once."""
++        materialize = getattr(context, "glm53_materialize_native_attention_metadata", None)
++        if materialize is not None:
++            materialize()
++            if self.early_runner is not None:
++                self.early_runner.ledger.on_materialize()
++        self._prepared_descriptors = None
++        context.glm53_cpu_addresses = None
+@@ -465,0 +558,4 @@
++        if hook is not None and hook.native_builder_deferral in ("shadow", "on"):
++            from vllm_ascend.worker.glm53_mk_early_runner import EarlyRunner, Rollout
++            hook._runner_ref = runner
++            hook.early_runner = EarlyRunner(Rollout.from_env(), plan_reader=hook.plan_cpu_addresses)

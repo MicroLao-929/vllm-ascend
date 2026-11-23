@@ -1,0 +1,233 @@
+--- model_runner_v1.py
++++ model_runner_v1.py
+@@ -1283,0 +1284,2 @@
++        *,
++        glm53_deferred_tables=None,
+@@ -1303 +1305,2 @@
+-        self.input_batch.block_table.commit_block_table(num_reqs)
++        if glm53_deferred_tables is None:
++            self.input_batch.block_table.commit_block_table(num_reqs)
+@@ -1621,5 +1624,12 @@
+-        self.input_batch.block_table.compute_slot_mapping(
+-            num_reqs,
+-            self.query_start_loc.gpu[: num_reqs + 1],
+-            self.positions[:total_num_scheduled_tokens],
+-        )
++        if glm53_deferred_tables is None:
++            self.input_batch.block_table.compute_slot_mapping(
++                num_reqs,
++                self.query_start_loc.gpu[: num_reqs + 1],
++                self.positions[:total_num_scheduled_tokens],
++            )
++        else:
++            glm53_deferred_tables.save_mapping(
++                num_reqs,
++                self.query_start_loc.gpu[: num_reqs + 1],
++                self.positions[:total_num_scheduled_tokens],
++            )
+@@ -2226,0 +2237,35 @@
++    def _glm53_early_facts(self, scheduler_output, *, num_tokens, runtime_mode,
++                           deferred_state_corrections):
++        """CPU-only facts for the pre-native-builder admission gate."""
++        from vllm_ascend.worker.glm53_mk_early_runner import Facts
++
++        offload = getattr(self, "offload_config", None)
++        uva = getattr(offload, "uva", None)
++        prefetch = getattr(offload, "prefetch", None)
++        try:
++            noop_offloader = type(get_offloader()).__name__ == "NoopOffloader"
++        except Exception:
++            noop_offloader = False
++        return Facts.from_runner(
++            self,
++            scheduler_output,
++            num_tokens=num_tokens,
++            runtime_mode=runtime_mode,
++            capturing=False,
++            deferred_state_corrections=deferred_state_corrections,
++            use_compress=getattr(self, "use_compress", False),
++            decoder_replay=getattr(self, "decoder_replay", None),
++            replay_active=getattr(self, "_replay_active", False),
++            with_prefill=getattr(self, "with_prefill", False),
++            encoder_inputs=len(
++                getattr(scheduler_output, "scheduled_encoder_inputs", ()) or ()
++            ),
++            offload_active=(
++                getattr(uva, "cpu_offload_gb", 0) != 0
++                or getattr(prefetch, "offload_group_size", 0) != 0
++                or not noop_offloader
++            ),
++            kv_transfer=has_kv_transfer_group(),
++            ec_transfer=has_ec_transfer(),
++        )
++
+@@ -2291,0 +2337 @@
++        early_prepared = None
+@@ -2363,8 +2409,15 @@
+-                (
+-                    logits_indices,
+-                    spec_decode_metadata,
+-                    total_num_scheduled_tokens,
+-                ) = self._prepare_inputs(
+-                    scheduler_output,
+-                    num_scheduled_tokens_np,
+-                )
++                lazy_tables = None
++                if (ep_hook is not None and ep_hook.lazy_tables and mk_hook is None
++                        and not has_kv_transfer_group() and not has_ec_transfer()
++                        and not enable_dsa_cp() and not enable_sp() and not lmhead_tp_enable()):
++                    from vllm_ascend.worker.glm53_mk_dp8_lazy_tables import DeferredBlockTables, eligible
++                    if eligible(self, ep_hook, scheduler_output, deferred_state_corrections_fn):
++                        lazy_tables = DeferredBlockTables(self.input_batch.block_table)
++                if lazy_tables is None:
++                    logits_indices, spec_decode_metadata, total_num_scheduled_tokens = self._prepare_inputs(
++                        scheduler_output, num_scheduled_tokens_np,
++                    )
++                else:
++                    logits_indices, spec_decode_metadata, total_num_scheduled_tokens = self._prepare_inputs(
++                        scheduler_output, num_scheduled_tokens_np, glm53_deferred_tables=lazy_tables,
++                    )
+@@ -2417,0 +2471,6 @@
++
++                if lazy_tables is not None and (
++                    cascade_attn_prefix_lens is not None or cudagraph_mode != CUDAGraphMode.NONE
++                    or should_ubatch or num_tokens_padded != 1 or num_reqs_padded != 1
++                ):
++                    lazy_tables.materialize()
+@@ -2501,15 +2560,44 @@
+-                (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
+-                    num_tokens=num_tokens_unpadded,
+-                    num_tokens_padded=num_tokens_padded,
+-                    num_reqs=num_reqs,
+-                    num_reqs_padded=num_reqs_padded,
+-                    max_query_len=max_num_scheduled_tokens,
+-                    ubatch_slices=ubatch_slices_attn,
+-                    logits_indices=logits_indices,
+-                    use_spec_decode=use_spec_decode,
+-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+-                    cudagraph_runtime_mode=cudagraph_mode,
+-                    batch_descriptor=batch_desc,
+-                )
++                def build_native_metadata():
++                    if lazy_tables is not None:
++                        lazy_tables.materialize()
++                    return self._build_attention_metadata(
++                        num_tokens=num_tokens_unpadded,
++                        num_tokens_padded=num_tokens_padded,
++                        num_reqs=num_reqs,
++                        num_reqs_padded=num_reqs_padded,
++                        max_query_len=max_num_scheduled_tokens,
++                        ubatch_slices=ubatch_slices_attn,
++                        logits_indices=logits_indices,
++                        use_spec_decode=use_spec_decode,
++                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
++                        num_scheduled_tokens_np=num_scheduled_tokens_np,
++                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
++                        cudagraph_runtime_mode=cudagraph_mode,
++                        batch_descriptor=batch_desc,
++                    )
++
++                # Pre-native-builder continuation: prove the one-token
++                # continuation on CPU first; skip the native per-layer metadata
++                # build only when every check passes.  Any miss builds natively.
++                early = getattr(ep_hook, "early_runner", None)
++                if early is None:
++                    attn_metadata, spec_decode_common_attn_metadata = build_native_metadata()
++                else:
++                    early_prepared = early.prepare(
++                        self._glm53_early_facts(
++                            scheduler_output,
++                            num_tokens=num_tokens_unpadded,
++                            runtime_mode=cudagraph_mode.name,
++                            deferred_state_corrections=deferred_state_corrections_fn is not None,
++                        ),
++                        build_native=build_native_metadata,
++                        forced_miss=getattr(ep_hook, "early_forced_miss", None),
++                    )
++                    if early_prepared.action == "defer":
++                        attn_metadata = spec_decode_common_attn_metadata = None
++                        early.ledger.on_build_skipped()
++                        if early.ledger.snapshot().get("native_build_skipped", 0) in (1, 64, 128, 256, 512, 1024):
++                            logger.info("GLM53 early MK native metadata builder skipped, ledger=%s", early.ledger.snapshot())
++                    else:
++                        attn_metadata, spec_decode_common_attn_metadata = build_native_metadata()
++                        early.ledger.on_native_build()
+@@ -2603,6 +2691,54 @@
+-            if mk_hook is not None:
+-                mk_step = mk_hook.try_decode(self, scheduler_output, get_forward_context(), positions, input_ids)
+-            if mk_step is None:
+-                hidden_states = self._model_forward(
+-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds,
+-                    glm53_ep_schedule=scheduler_output if ep_hook is not None else None, **model_kwargs
++            early_context = get_forward_context() if early_prepared is not None else None
++            if early_context is not None:
++                from vllm_ascend.worker.glm53_mk_early_runner import bind_forward_context
++                bind_forward_context(early_context, early_prepared)
++                early_context.glm53_shadow_ok = False
++                if early_prepared.action == "defer":
++                    # Materialised only if the round gate selects native; it
++                    # always runs before the bridge can write a cache tile.
++                    def restore_native_attention_metadata():
++                        nonlocal attn_metadata, spec_decode_common_attn_metadata
++                        from vllm_ascend.worker.glm53_mk_dp8_lazy_tables import bind_native_result
++                        with self.synchronize_input_prep():
++                            result = early_prepared.materialize()
++                        attn_metadata, spec_decode_common_attn_metadata = bind_native_result(early_context, result)
++
++                    early_context.glm53_materialize_native_attention_metadata = restore_native_attention_metadata
++            try:
++                if mk_hook is not None:
++                    mk_step = mk_hook.try_decode(self, scheduler_output, get_forward_context(), positions, input_ids)
++                if mk_step is None:
++                    hidden_states = self._model_forward(
++                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds,
++                        glm53_ep_schedule=scheduler_output if ep_hook is not None else None, **model_kwargs
++                    )
++                    if ep_hook is not None:
++                        mk_step = ep_hook.take_step()
++                        if mk_step is None:
++                            ep_hook.observe_native(self, scheduler_output)
++                        else:
++                            mk_hook = ep_hook
++                    if mk_hook is not None and mk_step is None:
++                        mk_hook.observe_native(self, scheduler_output)
++                else:
++                    hidden_states = mk_step.hidden_states
++            finally:
++                if early_context is not None:
++                    early_context.glm53_materialize_native_attention_metadata = None
++                    early_context.glm53_cpu_addresses = None
++                    early_prepared.finish()
++            if lazy_tables is not None:
++                outcome = "restored" if lazy_tables.restored else "skipped"
++                counts = ep_hook.lazy_table_counts
++                counts[outcome] += 1
++                if counts[outcome] in (1, 8, 64, 128, 256, 512, 1024):
++                    logger.info("GLM53 DP8 lazy block tables rank=%d outcome=%s counts=%s",
++                                ep_hook.gate.rank, outcome, dict(counts))
++            if early_prepared is not None:
++                if early_prepared.action == "shadow":
++                    early.ledger.on_shadow(bool(
++                        getattr(early_context, "glm53_shadow_ok", False)))
++                early.ledger.on_step(
++                    native_forward_ran=mk_step is None,
++                    mk_step_ran=mk_step is not None,
++                    deferred_this_step=early_prepared.action == "defer",
+@@ -2610,10 +2746,5 @@
+-                if ep_hook is not None:
+-                    mk_step = ep_hook.take_step()
+-                    if mk_step is None:
+-                        ep_hook.observe_native(self, scheduler_output)
+-                    else:
+-                        mk_hook = ep_hook
+-                if mk_hook is not None and mk_step is None:
+-                    mk_hook.observe_native(self, scheduler_output)
+-            else:
+-                hidden_states = mk_step.hidden_states
++                count=getattr(self, "_glm53_early_count", 0)+1
++                self._glm53_early_count=count
++                if count in (2, 8, 16, 32, 64, 128, 256, 512, 1024, 2048):
++                    logger.info("GLM53 early plan worker count=%d action=%s reason=%s statistics=%s",
++                                count, early_prepared.action, early_prepared.reason, early.ledger.snapshot())

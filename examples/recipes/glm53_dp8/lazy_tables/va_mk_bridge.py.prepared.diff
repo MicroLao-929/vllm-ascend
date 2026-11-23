@@ -1,0 +1,132 @@
+--- va_mk_bridge.py
++++ va_mk_bridge.py
+@@ -367 +367,2 @@
+-    def step(self, forward_context, *, request_id, position, input_ids, kda, mla, indexer):
++    def step(self, forward_context, *, request_id, position, input_ids, kda, mla, indexer,
++             cpu_addresses=None):
+@@ -380 +381,2 @@
+-                return self._step(forward_context, request_id, position, input_ids, kda, mla, indexer)
++                return self._step(forward_context, request_id, position, input_ids, kda, mla, indexer,
++                                  cpu_addresses)
+@@ -391 +393,2 @@
+-    def _step(self, context, request_id, position, input_ids, kda, mla, indexer):
++    def _step(self, context, request_id, position, input_ids, kda, mla, indexer,
++              cpu_addresses=None):
+@@ -404,0 +408,7 @@
++        imported = request_id != self._request
++        bound = getattr(context, "glm53_cpu_addresses", None)
++        if cpu_addresses is None and bound is not None:
++            identity, cpu_addresses = bound
++            if identity != (request_id, position):
++                raise ValueError(
++                    f"CPU plan identity {identity} differs from bridge step {(request_id, position)}")
+@@ -406,25 +416,26 @@
+-        _require(isinstance(metadata, dict), "VA bridge requires a per-layer ForwardContext metadata dict")
+-        imported = request_id != self._request
+-        reads = _DecodeMetadata()
+-        # Steady-state fast path: batch this step's native metadata reads into
+-        # one host transfer per dtype instead of one blocking transfer per
+-        # field.  Only the first token of a request keeps the original path.
+-        if self._batch_native_metadata and not imported:
+-            try:
+-                reads.prefetch(self._prefetch_plan(metadata, kda, mla, indexer, position))
+-            except Exception:
+-                # A field the plan cannot classify keeps the lazy native read.
+-                pass
+-        kda_slots = {layer: self._kda_slot(cache, metadata[cache.prefix], reads)
+-                     for layer, cache in kda.items()}
+-        previous_pages = (self._native_pages if self._reuse_cache_views and not imported
+-                          and self._native_pages is not None else None)
+-        mla_pages = {
+-            layer: self._mla_target(cache, metadata[cache.prefix], position, reads,
+-                                    previous=(previous_pages[layer][0]
+-                                              if previous_pages and layer in previous_pages else None))
+-            for layer, cache in mla.items()
+-        }
+-        idx_addresses = {
+-            layer: self._indexer_target(cache, metadata[cache.pool_prefix], metadata[cache.tail_prefix], position, reads,
+-                                        previous=(previous_pages[layer][1]
++        if cpu_addresses is not None and metadata is None:
++            # Pre-native-builder continuation: the plan was produced and
++            # validated before the native metadata builder was skipped.
++            _require(not imported and self._graph is not None
++                     and position == self._position + 1,
++                     "an MK CPU address plan requires the next position of the same initialized graph")
++            kda_slots, mla_pages, idx_addresses = cpu_addresses
++        else:
++            _require(isinstance(metadata, dict), "VA bridge requires a per-layer ForwardContext metadata dict")
++            reads = _DecodeMetadata()
++            # Steady-state fast path: batch this step's native metadata reads into
++            # one host transfer per dtype instead of one blocking transfer per
++            # field.  Only the first token of a request keeps the original path.
++            if self._batch_native_metadata and not imported:
++                try:
++                    reads.prefetch(self._prefetch_plan(metadata, kda, mla, indexer, position))
++                except Exception:
++                    # A field the plan cannot classify keeps the lazy native read.
++                    pass
++            kda_slots = {layer: self._kda_slot(cache, metadata[cache.prefix], reads)
++                         for layer, cache in kda.items()}
++            previous_pages = (self._native_pages if self._reuse_cache_views and not imported
++                              and self._native_pages is not None else None)
++            mla_pages = {
++                layer: self._mla_target(cache, metadata[cache.prefix], position, reads,
++                                        previous=(previous_pages[layer][0]
+@@ -432,2 +443,16 @@
+-            for layer, cache in indexer.items()
+-        }
++                for layer, cache in mla.items()
++            }
++            idx_addresses = {
++                layer: self._indexer_target(cache, metadata[cache.pool_prefix], metadata[cache.tail_prefix], position, reads,
++                                            previous=(previous_pages[layer][1]
++                                                      if previous_pages and layer in previous_pages else None))
++                for layer, cache in indexer.items()
++            }
++            if cpu_addresses is not None:
++                # shadow verification: the CPU plan must equal the native one
++                for label, cpu, native in zip(("KDA", "MLA", "Indexer"), cpu_addresses,
++                                              (kda_slots, mla_pages, idx_addresses)):
++                    if cpu != native:
++                        raise ValueError(
++                            f"CPU {label} plan differs from the native addresses at {position}")
++                context.glm53_shadow_ok = True
+@@ -532,0 +558,38 @@
++
++    def checked_cpu_addresses(self, position, kda, mla, indexer, plan):
++        """Validate a CPU StepAddressPlan against the bound caches, or None."""
++        kda_slots, mla_pages, idx_addresses = plan.kda_slots, plan.mla_pages, plan.idx_addresses
++        try:
++            _require(kda_slots.keys() == kda.keys() and mla_pages.keys() == mla.keys()
++                     and idx_addresses.keys() == indexer.keys(), "CPU plan does not cover the active layers")
++            for layer, cache in kda.items():
++                self._validate_kda_slot(cache, kda_slots[layer])
++            for layer, cache in mla.items():
++                _row_cache(cache.latent, (1, _LATENT), torch.bfloat16, self._device)
++                rows, pages = cache.latent.shape[1], mla_pages[layer]
++                width = pages.rows_per_id
++                _require(type(width) is int and 0 < width <= rows and rows % width == 0
++                         and pages.capacity == cache.latent.shape[0] * rows // width
++                         and len(pages.ids) == position // width + 1,
++                         "CPU MLA plan has incompatible physical pages")
++            prior_pools, prior_tail = divmod(position, _RATIO)
++            pools, open_rows = divmod(position + 1, _RATIO)
++            for layer, cache in indexer.items():
++                _row_cache(cache.pool, (1, _INDEX), torch.bfloat16, self._device)
++                _row_cache(cache.tail, (2 * _INDEX,), torch.float32, self._device)
++                rows, address = cache.pool.shape[1], idx_addresses[layer]
++                pages = address.pages
++                _require(rows > 0 and pages.rows_per_id == rows and pages.capacity == cache.pool.shape[0]
++                         and len(pages.ids) == (pools + rows - 1) // rows
++                         and cache.tail.shape[1] == _RATIO and cache.tail.stride(0) % (2 * _INDEX) == 0
++                         and 0 <= address.tail_page < cache.tail.shape[0]
++                         and address.history_rows == tuple(range(prior_tail)),
++                         "CPU Indexer plan has incompatible pool or tail geometry")
++                pool_slot = pages.slot(prior_pools) if open_rows == 0 else -1
++                pool_page, pool_row = divmod(pool_slot, rows) if pool_slot >= 0 else (None, None)
++                _require((address.pool_page, address.pool_row, address.tail_row)
++                         == (pool_page, pool_row, open_rows - 1 if open_rows else None),
++                         "CPU Indexer plan disagrees with the active pool/tail row")
++        except (IndexError, ValueError):
++            return None
++        return kda_slots, mla_pages, idx_addresses
