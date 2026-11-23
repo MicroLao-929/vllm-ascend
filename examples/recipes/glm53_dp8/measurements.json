@@ -1,0 +1,90 @@
+{
+  "mk-clean-baseline": {
+    "input_len": 128,
+    "output_len": 128,
+    "tpot": [
+      31.012280551181103,
+      31.407525748031496,
+      31.5557562992126,
+      30.63281692913386,
+      31.479732362204725,
+      30.99012102362205,
+      30.925275669291338
+    ],
+    "median_ms": 31.012280551181103,
+    "exact_seeded": 7,
+    "natural_vs_mk_baseline": {
+      "matched_sequences": 12,
+      "matched_positions": 1536
+    },
+    "decodes": 889,
+    "rank_events": 7112,
+    "receipt_sha256": "02fe7b58d1e777fa48d37f8c3e09eafd072caa8bf60ddd2e9cbd7bb61f76bbc7"
+  },
+  "mk-opt1-profile": {
+    "input_len": 128,
+    "output_len": 128,
+    "tpot": [
+      30.914423070866142,
+      29.20265031496063,
+      32.78851677165354,
+      28.614607952755904,
+      29.560719606299212,
+      29.518974803149607,
+      29.705430236220472
+    ],
+    "median_ms": 29.560719606299212,
+    "exact_seeded": 7,
+    "natural_vs_mk_baseline": {
+      "matched_sequences": 12,
+      "matched_positions": 1536
+    },
+    "decodes": 889,
+    "rank_events": 7112,
+    "receipt_sha256": "02fe7b58d1e777fa48d37f8c3e09eafd072caa8bf60ddd2e9cbd7bb61f76bbc7"
+  },
+  "mk-opt2-profile": {
+    "input_len": 128,
+    "output_len": 128,
+    "tpot": [
+      25.781587007874016,
+      24.980069921259844,
+      25.078589055118112,
+      25.109977244094488,
+      25.31537062992126,
+      25.195244803149606,
+      25.207904881889764
+    ],
+    "median_ms": 25.195244803149606,
+    "exact_seeded": 7,
+    "natural_vs_mk_baseline": {
+      "matched_sequences": 12,
+      "matched_positions": 1536
+    },
+    "decodes": 889,
+    "rank_events": 7112,
+    "receipt_sha256": "02fe7b58d1e777fa48d37f8c3e09eafd072caa8bf60ddd2e9cbd7bb61f76bbc7"
+  },
+  "mk-opt3-profile": {
+    "input_len": 128,
+    "output_len": 128,
+    "tpot": [
+      23.728374488188976,
+      23.104265826771652,
+      23.21009842519685,
+      23.199145118110238,
+      23.248554173228346,
+      23.372999842519686,
+      23.328596377952756
+    ],
+    "median_ms": 23.248554173228346,
+    "exact_seeded": 2,
+    "natural_vs_mk_baseline": {
+      "matched_sequences": 0,
+      "matched_positions": 326
+    },
+    "decodes": 889,
+    "rank_events": 7112,
+    "receipt_sha256": "d80ef6fde7d5bd1f221ce1362e22445d06b28ef7f29f61a9bca7978223862552"
+  }
+}

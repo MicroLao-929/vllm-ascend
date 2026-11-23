@@ -1,5 +1,7 @@
 """Single-request GLM-5.3-Flash VA prefill to MK decode cache handoff."""
 
+import inspect
+import os
 import logging
 from dataclasses import dataclass, field
 from threading import Lock
@@ -165,6 +167,55 @@ class _DecodeMetadata:
             self._reads[key] = entry
         return entry[1]
 
+    def prefetch(self, entries):
+        """Read many native metadata tensors with as few host transfers as possible.
+
+        ``entries`` is an iterable of ``(tensor, columns)`` matching what
+        :meth:`value`/`values`/``row`` will ask for in this step (``columns``
+        is None for a one-dimensional field).  Only entries whose shape and
+        dtype match the lazy reader are staged; anything else keeps the
+        original per-tensor ``tolist`` path.  Values are the exact device
+        contents: the same tensors are concatenated and copied to the host
+        once per dtype instead of once per field.
+        """
+        pending = []
+        seen = set()
+        for tensor, columns in entries:
+            if not isinstance(tensor, torch.Tensor) or tensor.device.type == "meta":
+                continue
+            key = (id(tensor), columns)
+            if key in self._reads or key in seen:
+                continue
+            if columns is None:
+                if tensor.ndim != 1 or tensor.dtype not in (torch.int32, torch.int64):
+                    continue
+                view = tensor
+            else:
+                if (tensor.ndim != 2 or tensor.shape[0] != 1 or tensor.shape[1] < columns
+                        or tensor.dtype not in (torch.int32, torch.int64)):
+                    continue
+                view = tensor[0, :columns]
+            seen.add(key)
+            pending.append((key, tensor, view.reshape(-1)))
+        if not pending:
+            return
+        groups = {}
+        for item in pending:
+            groups.setdefault((item[2].device, item[2].dtype), []).append(item)
+        staged = {}
+        try:
+            for items in groups.values():
+                host = torch.cat([flat for _, _, flat in items]).cpu().tolist()
+                offset = 0
+                for key, tensor, flat in items:
+                    width = flat.numel()
+                    staged[key] = (tensor, tuple(host[offset:offset + width]))
+                    offset += width
+        except Exception:
+            # A partial batch is useless to the caller; leave the lazy path.
+            return
+        self._reads.update(staged)
+
 
 def _copy_prefix(source, native, target, count, mk_pages, mk_page_stride):
     row = 0
@@ -234,7 +285,9 @@ class VAMKBridge:
     Device-produced metadata must be ready on that stream before the call.
     """
 
-    def __init__(self, model, *, ep2=False, ep_size=None, max_context_tokens=_PAGE):
+    def __init__(self, model, *, ep2=False, ep_size=None, max_context_tokens=_PAGE,
+                 batch_native_metadata=False, reuse_cache_views=False,
+                 batch_writeback=False, reuse_indexer_tail=False):
         args = model.model_args
         if ep_size is None:
             ep_size = 2 if ep2 else 1
@@ -285,6 +338,31 @@ class VAMKBridge:
         self._graph = None
         self._poisoned = False
         self._lock = Lock()
+        # Opt-in steady-state fast path.  Every option defaults off and any
+        # miss simply executes the original per-field/per-copy code below.
+        self._batch_native_metadata = bool(batch_native_metadata)
+        self._reuse_cache_views = bool(reuse_cache_views)
+        self._batch_writeback = bool(batch_writeback)
+        self._copy_pairs = None
+        if self._batch_writeback:
+            try:
+                from vllm_ascend.worker.glm53_mk_batched import copy_pairs
+            except Exception:
+                _LOG.warning("MK batched writeback helper is unavailable; keeping per-tensor copies")
+            else:
+                self._copy_pairs = copy_pairs
+        self._tail_reuse_supported = False
+        if reuse_indexer_tail:
+            try:
+                self._tail_reuse_supported = "reuse_indexer_tail" in inspect.signature(
+                    self._state.prepare_shared).parameters
+            except (TypeError, ValueError):
+                self._tail_reuse_supported = False
+        self._continuation_tails = (
+            {layer: (pool, None, None) for layer, pool in self._pool.items()}
+            if self._tail_reuse_supported else None
+        )
+        self._kda_views = None
 
     def step(self, forward_context, *, request_id, position, input_ids, kda, mla, indexer):
         """Consume one scheduled token and commit it to the VA-owned cache.
@@ -308,6 +386,7 @@ class VAMKBridge:
         with self._lock:
             if self._request == request_id:
                 self._request = self._position = self._locations = self._native_pages = None
+                self._kda_views = None
 
     def _step(self, context, request_id, position, input_ids, kda, mla, indexer):
         if self._poisoned:
@@ -325,39 +404,81 @@ class VAMKBridge:
                  "VA caches must cover the MK layers")
         metadata = context.attn_metadata
         _require(isinstance(metadata, dict), "VA bridge requires a per-layer ForwardContext metadata dict")
+        imported = request_id != self._request
         reads = _DecodeMetadata()
-        conv_states = {layer: self._kda_target(cache, metadata[cache.prefix], reads) for layer, cache in kda.items()}
-        mla_pages = {layer: self._mla_target(cache, metadata[cache.prefix], position, reads) for layer, cache in mla.items()}
+        # Steady-state fast path: batch this step's native metadata reads into
+        # one host transfer per dtype instead of one blocking transfer per
+        # field.  Only the first token of a request keeps the original path.
+        if self._batch_native_metadata and not imported:
+            try:
+                reads.prefetch(self._prefetch_plan(metadata, kda, mla, indexer, position))
+            except Exception:
+                # A field the plan cannot classify keeps the lazy native read.
+                pass
+        kda_slots = {layer: self._kda_slot(cache, metadata[cache.prefix], reads)
+                     for layer, cache in kda.items()}
+        previous_pages = (self._native_pages if self._reuse_cache_views and not imported
+                          and self._native_pages is not None else None)
+        mla_pages = {
+            layer: self._mla_target(cache, metadata[cache.prefix], position, reads,
+                                    previous=(previous_pages[layer][0]
+                                              if previous_pages and layer in previous_pages else None))
+            for layer, cache in mla.items()
+        }
         idx_addresses = {
-            layer: self._indexer_target(cache, metadata[cache.pool_prefix], metadata[cache.tail_prefix], position, reads)
+            layer: self._indexer_target(cache, metadata[cache.pool_prefix], metadata[cache.tail_prefix], position, reads,
+                                        previous=(previous_pages[layer][1]
+                                                  if previous_pages and layer in previous_pages else None))
             for layer, cache in indexer.items()
         }
         locations = (
             {layer: (slot, _layout(kda[layer].conv), _layout(kda[layer].recurrent), kda[layer].conv_dim_first)
-             for layer, (_, _, slot) in conv_states.items()},
+             for layer, slot in kda_slots.items()},
             {layer: _layout(mla[layer].latent) for layer in mla_pages},
             {layer: (address.tail_page, _layout(indexer[layer].pool), _layout(indexer[layer].tail))
              for layer, address in idx_addresses.items()},
         )
         native_pages = {layer: (pages, idx_addresses[layer].pages) for layer, pages in mla_pages.items()}
-        imported = request_id != self._request
         if not imported:
             pages_extend = all(new.extends(old) for layer, pair in native_pages.items()
                                for new, old in zip(pair, self._native_pages[layer]))
             _require(position == self._position + 1 and locations == self._locations and pages_extend,
                      "VA request must advance by one token with unchanged cache locations")
+        # The committed layouts prove the cache tensors, slots and strides are
+        # unchanged, so their per-layer views (34 slices and transposes) need
+        # not be rebuilt on a continuation.
+        if (self._reuse_cache_views and not imported and self._kda_views is not None
+                and locations == self._locations):
+            conv_states = self._kda_views
+        else:
+            conv_states = {layer: self._kda_views_for_slot(cache, kda_slots[layer])
+                           for layer, cache in kda.items()}
 
         # Validate every destination before touching any data. MK execution
         # uses bridge-owned buffers, then writeback commits to VA in stream order.
         try:
             initial = None
+            reuse_tails = False
             if imported:
                 initial = self._import_prefix(position, conv_states, mla, mla_pages, indexer, idx_addresses)
-            tails = self._import_tail(position, indexer, idx_addresses)
+                tails = self._import_tail(position, indexer, idx_addresses)
+            elif self._continuation_tails is not None:
+                # MK's own Indexer tail buffers were written by the previous
+                # completed graph for this exact request/slot/position.  The
+                # blockrt opt-in keeps them instead of re-zeroing and copying
+                # VA's identical history back in.
+                tails = self._continuation_tails
+                reuse_tails = True
+            else:
+                tails = self._import_tail(position, indexer, idx_addresses)
             if self._graph is None:
                 self._model.clear_graph_cache()
             paging = ({"page": _SCRATCH_PAGE} if self.max_context_tokens <= _PAGE
                       else {"page_table": self._page_table})
+            if self.max_context_tokens > _PAGE and os.getenv("MK_GLM53_REUSE_PAGED_METADATA") == "1":
+                paging["reuse_paged_metadata"] = True
+            if reuse_tails:
+                paging["reuse_indexer_tail"] = True
             batch, positions = self._state.prepare_shared(position, kda=initial, mla=self._mla, indexer=tails, **paging)
             self._token.copy_(input_ids)
             logits = self._model.forward(batch, self._token, positions, None)
@@ -378,31 +499,87 @@ class VAMKBridge:
 
         self._request, self._position, self._locations, self._graph = request_id, position, locations, graph
         self._native_pages = native_pages
+        if self._reuse_cache_views:
+            self._kda_views = conv_states
         _LOG.info("VA/MK decode request=%s position=%d imported=%s graph=%#x reused=%s pool_boundary=%s "
                   "kda_slots=%s mla_pages=%s indexer=%s", request_id, position, imported, id(graph), reused,
-                  (position + 1) % _RATIO == 0,
-                  {layer: slot for layer, (_, _, slot) in conv_states.items()},
+                  (position + 1) % _RATIO == 0, kda_slots,
                   {layer: pages.ids[-1] for layer, pages in mla_pages.items()}, idx_addresses)
         return DecodeResult(logits, hidden, imported, reused)
 
-    def _kda_target(self, cache, metadata, reads):
+    def _kda_slot(self, cache, metadata, reads):
         _require((metadata.num_actual_tokens, metadata.num_decodes, metadata.num_decode_tokens,
                   metadata.num_prefills, metadata.num_spec_decodes) == (1, 1, 1, 0, 0)
                  and metadata.spec_sequence_masks is None
                  and reads.values(metadata.non_spec_query_start_loc, 2, "KDA query boundaries") == (0, 1),
                  "VA KDA metadata must represent one non-speculative decode token")
         slot = reads.value(metadata.non_spec_state_indices_tensor, "KDA state index")
+        self._validate_kda_slot(cache, slot)
+        return slot
+
+    def _validate_kda_slot(self, cache, slot):
         conv_shape = self._conv_shape[::-1] if cache.conv_dim_first else self._conv_shape
         _require(cache.conv.shape[1:] == conv_shape and cache.recurrent.shape[1:] == self._recurrent_shape
                  and cache.conv.dtype == torch.bfloat16 and cache.recurrent.dtype == torch.float32
                  and cache.conv.device == cache.recurrent.device == self._device
                  and 0 <= slot < min(cache.conv.shape[0], cache.recurrent.shape[0]), "invalid VA KDA cache or slot")
+
+    @staticmethod
+    def _kda_views_for_slot(cache, slot):
         conv = cache.conv[slot]
         if cache.conv_dim_first:
             conv = conv.transpose(-1, -2)
-        return conv, cache.recurrent[slot].transpose(-1, -2), slot
+        return conv, cache.recurrent[slot].transpose(-1, -2)
 
-    def _mla_target(self, cache, metadata, position, reads):
+    def _prefetch_plan(self, metadata, kda, mla, indexer, position):
+        """List the native ``(tensor, columns)`` reads the validation will make.
+
+        This mirrors :meth:`_kda_slot`, :meth:`_mla_target` and
+        :meth:`_indexer_target` without touching device data: only Python
+        geometry and metadata attributes are inspected.  ``_DecodeMetadata``
+        ignores any entry it cannot classify and the original lazy read still
+        runs, so an incomplete plan costs a host sync, never correctness.
+        """
+        entries = []
+
+        def add(tensor, columns=None):
+            entries.append((tensor, columns))
+
+        for cache in kda.values():
+            item = metadata[cache.prefix]
+            add(item.non_spec_query_start_loc)
+            add(item.non_spec_state_indices_tensor)
+        for cache in mla.values():
+            item = metadata[cache.prefix]
+            add(item.query_start_loc)
+            add(item.seq_lens)
+            add(item.positions)
+            add(item.slot_mapping)
+            width = item.block_size
+            if type(width) is int and width > 0:
+                add(item.block_table, (position + 1 + width - 1) // width)
+        pools = (position + 1) // _RATIO
+        for cache in indexer.values():
+            pool = metadata[cache.pool_prefix]
+            tail = metadata[cache.tail_prefix]
+            add(pool.query_start_loc)
+            add(pool.positions)
+            add(pool.start_pos)
+            add(pool.raw_seq_lens)
+            add(pool.seq_lens)
+            add(pool.pool_tail)
+            add(pool.slot_mapping)
+            add(pool.pooled_slot_mapping)
+            rows = cache.pool.shape[1]
+            if type(rows) is int and rows > 0:
+                add(pool.block_table, (pools + rows - 1) // rows)
+            add(tail.block_table, 1)
+            cann = tail.cann_inputs
+            add(cann.history_indices, _RATIO)
+            add(cann.write_indices, _RATIO)
+        return entries
+
+    def _mla_target(self, cache, metadata, position, reads, *, previous=None):
         _row_cache(cache.latent, (1, _LATENT), torch.bfloat16, self._device)
         rows = cache.latent.shape[1]
         # The NoPE sparse MLA layer is registered with AscendSFABackend.
@@ -414,12 +591,13 @@ class VAMKBridge:
                  and reads.value(metadata.seq_lens, "MLA length") == position + 1
                  and reads.value(metadata.positions, "MLA decode position") == position,
                  "VA sparse NoPE MLA metadata must represent the scheduled decode token")
-        pages = reads.active_pages(metadata.block_table, position + 1, metadata.block_size, cache.latent.shape[0] * rows)
+        pages = reads.active_pages(metadata.block_table, position + 1, metadata.block_size,
+                                   cache.latent.shape[0] * rows, previous=previous)
         slot = reads.value(metadata.slot_mapping, "MLA slot")
         _require(slot == pages.slot(position), "VA MLA slot disagrees with the active prefix page")
         return pages
 
-    def _indexer_target(self, cache, pool, tail, position, reads):
+    def _indexer_target(self, cache, pool, tail, position, reads, *, previous=None):
         _row_cache(cache.pool, (1, _INDEX), torch.bfloat16, self._device)
         _row_cache(cache.tail, (2 * _INDEX,), torch.float32, self._device)
         # The native KeyPool writer splits pooled_slot_mapping using cache.shape[1].
@@ -435,7 +613,8 @@ class VAMKBridge:
                  and reads.value(pool.raw_seq_lens, "KPool token length") == position + 1
                  and reads.value(pool.seq_lens, "KPool compressed length") == pools
                  and reads.value(pool.pool_tail, "KPool tail length") == open_rows, "invalid VA KPool decode metadata")
-        pages = reads.active_pages(pool.block_table, pools, rows, cache.pool.shape[0] * rows)
+        pages = reads.active_pages(pool.block_table, pools, rows, cache.pool.shape[0] * rows,
+                                   previous=previous)
         slot = pages.slot(prior_pools) if open_rows == 0 else -1
         pool_page, pool_row = divmod(slot, rows) if slot >= 0 else (None, None)
         _require(reads.value(pool.slot_mapping, "KPool token slot") == slot
@@ -468,22 +647,57 @@ class VAMKBridge:
             _copy_prefix_runs(mla[layer].latent, pages, self._mla[layer], position, self._page_table, 1)
             _copy_prefix_runs(indexer[layer].pool, idx_addresses[layer].pages, self._pool[layer],
                          position // _RATIO, self._page_table, _RATIO)
-        return {layer: (conv.contiguous(), recurrent.contiguous()) for layer, (conv, recurrent, _) in kda.items()}
+        return {layer: (conv.contiguous(), recurrent.contiguous()) for layer, (conv, recurrent) in kda.items()}
 
     def _import_tail(self, position, indexer, idx_addresses):
         count = position % _RATIO
-        result = {}
+        result, pairs = {}, []
         for layer, address in idx_addresses.items():
             keys, gates = self._keys[layer][:count], self._gates[layer][:count]
             for i, row in enumerate(address.history_rows):
                 source = indexer[layer].tail[address.tail_page, row]
-                keys[i].copy_(source[:_INDEX])  # FP32 CANN key -> BF16 MK key.
-                gates[i].copy_(source[_INDEX:])  # Unmodified FP32 raw gate, before APE.
+                pairs.append((keys[i], source[:_INDEX]))  # FP32 CANN key -> BF16 MK key.
+                pairs.append((gates[i], source[_INDEX:]))  # Unmodified FP32 raw gate, before APE.
             result[layer] = (self._pool[layer], keys, gates)
+        if not (self._copy_pairs is not None and self._copy_pairs(pairs)):
+            for destination, source in pairs:
+                destination.copy_(source)
         return result
 
-    def _commit(self, position, kda, mla, mla_pages, indexer, idx_addresses):
-        for layer, (conv, recurrent, _) in kda.items():
+    def _commit(self, position, conv_states, mla, mla_pages, indexer, idx_addresses):
+        if self._copy_pairs is not None:
+            kda_pairs = []
+            for layer, (conv, recurrent) in conv_states.items():
+                kda_pairs.append((conv, self._state.kda.conv[layer][0]))
+                kda_pairs.append((recurrent, self._state.kda.temporal[layer][0]))
+            if not self._copy_pairs(kda_pairs):
+                for destination, source in kda_pairs:
+                    destination.copy_(source)
+            attention_pairs = []
+            for layer, pages in mla_pages.items():
+                page, row = divmod(pages.slot(position), mla[layer].latent.shape[1])
+                mk_page, mk_row = divmod(position, _PAGE)
+                attention_pairs.append((mla[layer].latent[page, row],
+                                        self._mla[layer][self._page_table[mk_page], mk_row]))
+                cache, address = indexer[layer], idx_addresses[layer]
+                if address.pool_row is not None:
+                    mk_page, mk_row = divmod(position // _RATIO, _PAGE)
+                    attention_pairs.append((
+                        cache.pool[address.pool_page, address.pool_row],
+                        self._pool[layer][self._page_table[_RATIO * mk_page], mk_row]))
+                else:
+                    tail = cache.tail[address.tail_page, address.tail_row]
+                    mk_slot = position % _RATIO
+                    attention_pairs.append((tail[:_INDEX],
+                                            self._state.indexer.tail_k_buffer[layer][0, mk_slot]))
+                    attention_pairs.append((tail[_INDEX:],
+                                            self._state.indexer.tail_score_buffer[layer][0, mk_slot]))
+            if not self._copy_pairs(attention_pairs):
+                for destination, source in attention_pairs:
+                    destination.copy_(source)
+            return
+        # Original per-tensor writeback, unchanged when batching is disabled.
+        for layer, (conv, recurrent) in conv_states.items():
             conv.copy_(self._state.kda.conv[layer][0])
             recurrent.copy_(self._state.kda.temporal[layer][0])
         for layer, pages in mla_pages.items():

@@ -26,3 +26,11 @@ worker 在一次 decode 内复用桥接元数据，合并连续页复制，将�
 在定长协议上设置 `GLM53_DP8_LOCAL_CONTROL=1`，八个 worker 用 Linux 共享内存和本地通知完成每步的选择、就绪和完成确认。初始化通过 Gloo 协商并核对网络和进程命名空间、对端 rank 身份。此项要求八个进程位于同一主机及命名空间。分机部署保留原 Gloo 配置。
 
 八进程 CPU 微基准中，每次选主和两次确认的中位时长从 Gloo 的 2.017 ms 降到 0.168 ms，包含 160 步并跳过前十步。端到端服务还包含模型计算和专家通信。运行 `python3 tests/ut/recipes/test_glm53_dp8_ipc.py` 可验证八种来源 rank 及多个来源争用时的集体决定。
+
+## 缓存视图、Indexer 尾部与写回
+
+同一请求的连续 token 共用缓存视图和已验证的页表绑定。桥接层批量读取原生元数据、批量提交格式匹配的缓存写回；缺少接口或批量复制失败时，执行逐项路径。Indexer 尾部和页表复用依赖 MegaKernel 侧配套的 `MKDecodeState.prepare_shared` 接口，部署时先安装该仓库的 GLM-5.3 页式状态补丁。
+
+在上节配置之上打开 `MK_GLM53_BATCH_NATIVE_METADATA=1`、`MK_GLM53_REUSE_CACHE_VIEWS=1`、`MK_GLM53_BATCH_WRITEBACK=1`、`MK_GLM53_REUSE_INDEXER_TAIL=1` 和 `MK_GLM53_REUSE_PAGED_METADATA=1`。单机本地控制与这些选项合用后，支持采集的服务在暂停采集期间七次请求中位 TPOT 为 29.561 ms。另起的未插桩静态基线为 31.012 ms。两者运行条件不同，没有对每个应用层开关拆分端到端收益。
+
+七条固定输入与此前 MK 的输出完全一致，另十二条自然输入的 1,536 个输出位置全同，八个 rank 的 7,112 条专家回执摘要也一致。各次 TPOT 与摘要在 `examples/recipes/glm53_dp8/measurements.json`。独立的拷贝及失败回退回归见 `tests/ut/recipes/test_glm53_dp8_cache_copy.py`。这些精度统计的参照为改动前 MK；与原生 target 的对比应单独报告。

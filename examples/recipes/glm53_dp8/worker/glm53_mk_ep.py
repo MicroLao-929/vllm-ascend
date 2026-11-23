@@ -38,6 +38,11 @@ def _require(ok, message):
         raise RuntimeError(f"GLM53 MK EP: {message}")
 
 
+def _cache_hot_flag(name):
+    """Read an opt-in bridge flag with the same spellings as the other stages."""
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _log_hbm(rank, phase):
     free, total = torch.npu.mem_get_info()
     logger.info("GLM53 MK EP rank=%d phase=%s hbm_free_gib=%.3f hbm_total_gib=%.3f",
@@ -370,7 +375,21 @@ def _construct(runner, rank, runtime, gate):
             logger.info("GLM53 MK EP rank=%d lm_head=va-native", rank)
         _require(model.device_id == torch.npu.current_device(), "MK and VA devices differ")
         bridge_options = {"max_context_tokens": capacity} if capacity != 64 else {}
+        # Opt-in steady-state cache fast path.  Defaults are off, so an
+        # unmodified launch keeps the exact v0.30 decode path.  The flags only
+        # affect the rank that owns the real request; idle companions never
+        # call the bridge.
+        fast_supported = tp_size == 1
+        fast = {
+            "batch_native_metadata": fast_supported and _cache_hot_flag("MK_GLM53_BATCH_NATIVE_METADATA"),
+            "reuse_cache_views": fast_supported and _cache_hot_flag("MK_GLM53_REUSE_CACHE_VIEWS"),
+            "batch_writeback": fast_supported and _cache_hot_flag("MK_GLM53_BATCH_WRITEBACK"),
+            "reuse_indexer_tail": fast_supported and _cache_hot_flag("MK_GLM53_REUSE_INDEXER_TAIL"),
+        }
+        bridge_options.update(fast)
         bridge = VAMKBridge(model, ep_size=plan.size, **bridge_options)
+        logger.info("GLM53 MK cache fast path rank=%d %s indexer_tail_reuse_supported=%s",
+                    rank, fast, bridge._tail_reuse_supported)
         companion = idle_hidden = None
         if tp_size == 1:
             companion = Glm53MKEPCompanion(model, ep_rank=rank, device_id=model.device_id)
