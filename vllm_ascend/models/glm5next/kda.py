@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+import os
+
 import torch
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -44,6 +46,24 @@ from vllm_ascend.ops.triton.kda.kda import (
     chunk_kda_with_fused_gate,
     fused_recurrent_kda,
 )
+
+# Bring-up switches for the KDA core attention.  The Triton chunked-prefill
+# kernel computes a different recurrence from the recurrent kernel and traps on
+# deep models, so the prefill branch can run the plain-PyTorch reference
+# (GLM53_KDA_TORCH=1).  Plain decode (one token per sequence) keeps the Triton
+# recurrent kernel, which matches the reference exactly.
+_KDA_TORCH_PREFILL = os.environ.get(
+    "GLM53_KDA_TORCH_PREFILL", os.environ.get("GLM53_KDA_TORCH", "0")
+) == "1"
+_KDA_TORCH_DECODE = os.environ.get(
+    "GLM53_KDA_TORCH_DECODE", os.environ.get("GLM53_KDA_TORCH", "0")
+) == "1"
+_PREFILL_RECURRENT = os.environ.get("GLM53_KDA_PREFILL_RECURRENT") == "1"
+# AscendC KDA kernels from flash-linear-attention-npu (fla_npu).  The reference
+# GLM-5.3 serving branch drives both the recurrent decode and the chunked
+# prefill through these ops instead of the Triton/PyTorch fallbacks.
+_KDA_FLA_DECODE = os.environ.get("GLM53_KDA_FLA_DECODE") == "1"
+_KDA_FLA_PREFILL = os.environ.get("GLM53_KDA_FLA_PREFILL") == "1"
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -156,13 +176,25 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+        # Native HF FP8 checkpoints omit the KDA scales, so the parent is built
+        # without quantization.  ModelSlim MXFP8 checkpoints do ship scales for
+        # every KDA projection; those projections are handed to the quant
+        # config below so prefill matches the MegaKernel decode path.
         saved_quant_config = vllm_config.quant_config
         try:
             vllm_config.quant_config = None
             super().__init__(config, vllm_config, prefix)
         finally:
             vllm_config.quant_config = saved_quant_config
+
+        def projection_quant_config(name: str):
+            from vllm_ascend.quantization.configs.modelslim_config import AscendModelSlimConfig
+
+            if isinstance(saved_quant_config, AscendModelSlimConfig) and (
+                saved_quant_config.uses_glm5next_mxfp8_kda_projection(f"{prefix}.{name}")
+            ):
+                return saved_quant_config
+            return None
 
         self.head_dim = config.linear_head_dim
         self.num_heads = config.linear_num_heads
@@ -189,7 +221,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             replicated_shard_ids=(4, 5),
             tp_size=self.tp_size,
             bias=False,
-            quant_config=self.quant_config,
+            quant_config=projection_quant_config("in_proj_qkvbfg_a"),
             prefix=f"{prefix}.in_proj_qkvbfg_a",
         )
 
@@ -197,7 +229,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self.head_dim,
             projection_size,
             bias=False,
-            quant_config=self.quant_config,
+            quant_config=projection_quant_config("f_b_proj"),
             prefix=f"{prefix}.f_b_proj",
         )
         self.dt_bias = nn.Parameter(torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32))
@@ -243,7 +275,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self.head_dim,
             projection_size,
             bias=False,
-            quant_config=self.quant_config,
+            quant_config=projection_quant_config("g_b_proj"),
             prefix=f"{prefix}.g_b_proj",
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
@@ -251,7 +283,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             projection_size,
             self.hidden_size,
             bias=False,
-            quant_config=self.quant_config,
+            quant_config=projection_quant_config("o_proj"),
             prefix=f"{prefix}.o_proj",
         )
 
@@ -282,6 +314,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
+        from vllm_ascend.models.glm5next.model import trace
+
+        trace(f"{self.prefix} in_proj")
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
         qkv, beta_raw, f_a, g_a = projected.split(
@@ -307,6 +342,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
+        trace(f"{self.prefix} gate_proj")
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
@@ -320,6 +356,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
         )
+        trace(f"{self.prefix} core_attn")
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
@@ -367,6 +404,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         beta = beta[:, :num_actual_tokens]
 
         (conv_state, recurrent_state) = constant_caches
+        from vllm_ascend.models.glm5next.model import trace
+
+        trace(f"{self.prefix} fwd qkv={tuple(qkv_proj_states.shape)} conv={tuple(conv_state.shape)}"
+              f" rec={tuple(recurrent_state.shape)}"
+              f" hs={None if has_initial_state is None else tuple(has_initial_state.shape)}"
+              f" qsl={None if non_spec_query_start_loc is None else tuple(non_spec_query_start_loc.shape)}"
+              f" dim_first={self._conv_state_dim_first} pre={attn_metadata_narrowed.num_prefills}"
+              f" dec={attn_metadata_narrowed.num_decodes}")
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         # Layout is process-global and resolved once at init (see __init__).
@@ -379,6 +424,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # three calls. The merged weight is q|k|v conv weights concatenated;
         # built once and cached (params are fixed after load). conv_state is
         # already stored as the merged q|k|v state, so it is used directly.
+        trace(f"{self.prefix} pre_conv")
         if self._merged_conv_weight is None:
 
             def _w(m):
@@ -390,6 +436,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             ).contiguous()
         conv_weights = self._merged_conv_weight
         conv_bias = self.q_conv1d.bias
+        trace(f"{self.prefix} mconv {tuple(conv_weights.shape)} {conv_weights.dtype}")
 
         # Split projections / gating into spec (draft-verify) and non-spec token
         # groups when speculative decoding is active. Spec tokens carry
@@ -445,6 +492,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         q_ns = k_ns = v_ns = None
         if attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
+            trace(f"{self.prefix} conv_call")
             qkv_ns = causal_conv1d_fn(
                 qkv_ns.transpose(0, 1),
                 conv_weights,
@@ -456,6 +504,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata_narrowed,
             ).transpose(0, 1)
+            trace(f"{self.prefix} conv")
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
@@ -521,26 +570,69 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
             initial_state = gather_initial_states(recurrent_state, non_spec_state_indices_tensor, has_initial_state)
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_kda_with_fused_gate(
-                q=_rearr(q_ns),
-                k=_rearr(k_ns),
-                v=_rearr(v_ns),
-                raw_g=g1_ns,
-                # Chunk path wants the pre-sigmoided fp32 beta (its kernels
-                # don't sigmoid); beta_ns is raw bf16 from forward.
-                beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
-                A_log=self.A_log,
-                g_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
-                safe_gate=safe_gate,
-                lower_bound=lower_bound,
-            )
+            if _KDA_TORCH_PREFILL:
+                from vllm_ascend.models.glm5next.ops.kda_reference import (
+                    kda_recurrence,
+                    safe_gate,
+                )
+
+                core_attn_out_non_spec, last_recurrent_state = kda_recurrence(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    g=safe_gate(g1_ns, self.A_log, self.dt_bias, lower_bound),
+                    beta=beta_ns.float().sigmoid(),
+                    initial_state=initial_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                )
+            elif _PREFILL_RECURRENT:
+                # Bring-up fallback: the chunked prefill kernel faults with an
+                # aicore trap on deep 45-layer prefill; the recurrent kernel is
+                # the same math and is already stable for decode. The gathered
+                # copy is the "cache": inplace updates write rows 0..N-1, then
+                # scatter_states commits them back.
+                ssm_idx = torch.arange(
+                    initial_state.shape[0], dtype=torch.int32, device=initial_state.device
+                )
+                core_attn_out_non_spec, last_recurrent_state = fused_recurrent_kda(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    g=g1_ns,
+                    beta=beta_ns,
+                    initial_state=initial_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    ssm_state_indices=ssm_idx,
+                    out=None,
+                    sigmoid_beta=True,
+                    a_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    compute_gate=True,
+                    lower_bound=lower_bound,
+                )
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = chunk_kda_with_fused_gate(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    raw_g=g1_ns,
+                    # Chunk path wants the pre-sigmoided fp32 beta (its kernels
+                    # don't sigmoid); beta_ns is raw bf16 from forward.
+                    beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
+                    A_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    safe_gate=safe_gate,
+                    lower_bound=lower_bound,
+                )
+            trace(f"{self.prefix} chunk")
             # Init cache
             scatter_states(
                 recurrent_state,
@@ -556,23 +648,76 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Gate computed in-kernel (COMPUTE_GATE), beta sigmoided in-kernel.
             if not use_spec:
                 ns_out = spec_out
-            core_attn_out_non_spec, _ = fused_recurrent_kda(
-                q=_rearr(q_ns),
-                k=_rearr(k_ns),
-                v=_rearr(v_ns),
-                g=g1_ns,
-                beta=beta_ns,
-                initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc[: attn_metadata_narrowed.num_decodes + 1],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                out=ns_out,
-                sigmoid_beta=True,
-                a_log=self.A_log,
-                g_bias=self.dt_bias,
-                compute_gate=True,
-                lower_bound=lower_bound,
-            )
+            if _KDA_FLA_DECODE:
+                from fla_npu.ops.ascendc import recurrent_kda as _fla_recurrent_kda
+
+                core_attn_out_non_spec, _ = _fla_recurrent_kda(
+                    _rearr(q_ns).contiguous(),
+                    _rearr(k_ns).contiguous(),
+                    _rearr(v_ns).contiguous(),
+                    g1_ns.contiguous(),
+                    beta_ns.contiguous(),
+                    recurrent_state,
+                    cu_seqlens=non_spec_query_start_loc[
+                        : attn_metadata_narrowed.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    A_log=self.A_log.reshape(-1).contiguous(),
+                    dt_bias=self.dt_bias.contiguous(),
+                    num_accepted_tokens=None,
+                    layout="BSND",
+                    scale=self.head_dim**-0.5,
+                    output_final_state=False,
+                    inplace_final_state=True,
+                    state_v_first=True,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    use_beta_sigmoid_in_kernel=True,
+                    allow_neg_eigval=False,
+                    safe_gate=lower_bound is not None,
+                    lower_bound=lower_bound if lower_bound is not None else -5.0,
+                )
+                if ns_out is not None:
+                    ns_out.copy_(core_attn_out_non_spec)
+                    core_attn_out_non_spec = ns_out
+            elif _KDA_TORCH_DECODE:
+                from vllm_ascend.models.glm5next.ops.kda_reference import (
+                    kda_decode_step,
+                    safe_gate,
+                )
+
+                core_attn_out_non_spec = kda_decode_step(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    g=safe_gate(g1_ns, self.A_log, self.dt_bias, lower_bound),
+                    beta=beta_ns.float().sigmoid(),
+                    state_cache=recurrent_state,
+                    state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata_narrowed.num_decodes
+                    ],
+                )
+                if ns_out is not None:
+                    ns_out.copy_(core_attn_out_non_spec)
+                    core_attn_out_non_spec = ns_out
+            else:
+                core_attn_out_non_spec, _ = fused_recurrent_kda(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    g=g1_ns,
+                    beta=beta_ns,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc[: attn_metadata_narrowed.num_decodes + 1],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    out=ns_out,
+                    sigmoid_beta=True,
+                    a_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    compute_gate=True,
+                    lower_bound=lower_bound,
+                )
 
         # --- merge spec / non-spec outputs back into token order ---
         if use_spec and core_attn_out_non_spec is not None:

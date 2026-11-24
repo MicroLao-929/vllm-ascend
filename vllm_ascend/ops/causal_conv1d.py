@@ -129,11 +129,23 @@ def causal_conv1d_fn(
     if conv_states.shape[-1] < state_len:
         raise RuntimeError(f"causal_conv1d_fn: conv_states too short, need >= {state_len}, got {conv_states.shape[-1]}")
 
+    if __import__("os").environ.get("GLM53_DEBUG_TRACE") == "1":
+        import sys
+        print(f"[glm53] cc x={tuple(x.shape)} w={tuple(weight.shape)} st={tuple(conv_states.shape)}"
+              f" his={has_initial_state.tolist() if has_initial_state.numel() < 8 else has_initial_state.numel()}",
+              file=sys.stderr, flush=True)
     seqlens = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
+    if __import__("os").environ.get("GLM53_DEBUG_TRACE") == "1":
+        import sys
+        print(f"[glm53] cc seqlens={seqlens}", file=sys.stderr, flush=True)
     splits = torch.split(x, seqlens, dim=-1)
 
     out_chunks = []
+    import os as _os, sys as _sys
+    _dbg = _os.environ.get("GLM53_DEBUG_TRACE") == "1"
     for i, x_s in enumerate(splits):
+        if _dbg:
+            print(f"[glm53] cc chunk{i} x={tuple(x_s.shape)}", file=_sys.stderr, flush=True)
         cache_idx = int(cache_indices[i].item())
         if cache_idx == pad_slot_id:
             continue
@@ -219,6 +231,41 @@ def causal_conv1d_update(
 
     out = x.clone()
 
+    def _device_update(x2d: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """Host-sync-free update of one token per sequence.
+
+        Plain decode reads one token per request, so the state row can be
+        gathered, convolved and scattered with tensor indices only.  PAD rows
+        are redirected to slot 0 and then written back unchanged, which keeps
+        the operation branch-free and therefore capturable by ACL graphs (a
+        ``.item()`` here is what previously forced the whole model to run
+        eager).
+        """
+        valid = idx != pad_slot_id
+        safe = torch.where(valid, idx, torch.zeros_like(idx))
+        states = conv_state.index_select(0, safe)  # [B, dim, state_len_total]
+        history = states[..., :state_len]
+        window = torch.cat(
+            [history.to(weight.dtype), x2d.to(weight.dtype).unsqueeze(-1)], dim=-1
+        )
+        conv = F.conv1d(window, weight.unsqueeze(1), bias, groups=dim)
+        step = torch.where(
+            valid.view(-1, 1, 1), window[..., -state_len:].to(conv_state.dtype), history
+        )
+        if states.shape[-1] > state_len:
+            step = torch.cat([step, states[..., state_len:]], dim=-1)
+        conv_state.index_copy_(0, safe, step)
+        return conv if activation is None else F.silu(conv)
+
+    if (
+        query_start_loc is None
+        and num_accepted_tokens is None
+        and conv_state_indices is not None
+        and x.dim() == 2
+    ):
+        indices = conv_state_indices[: x.shape[0]].to(torch.int64)
+        return _device_update(x, indices).squeeze(-1).to(original_x_dtype)
+
     def _select_state(i: int) -> torch.Tensor | None:
         if conv_state_indices is not None:
             idx = int(conv_state_indices[i].item())
@@ -245,6 +292,48 @@ def causal_conv1d_update(
         # [1, dim, L] -> [L, dim]
         return out_ref.squeeze(0).transpose(0, 1)
 
+    def _run_spec_block(seq_tokens: torch.Tensor, state: torch.Tensor, accepted: int) -> torch.Tensor:
+        """Slide the convolution window over a draft-verify block.
+
+        Mirrors upstream's spec-decoding rollout: the state row holds
+        ``state_len + num_spec`` entries.  The previous step stored
+        ``[history, draft tokens]``, so this step reads its ``state_len``
+        history entries starting at ``accepted - 1``, runs the *whole* block,
+        and stores ``[history after the block, draft tail]`` back.  The next
+        step can then rewind to any accepted length inside that window.
+        """
+        width_entries = state.shape[-1]
+        num_spec = width_entries - state_len
+        offset = accepted - 1
+        if offset < 0 or offset + state_len > width_entries:
+            raise RuntimeError(
+                f"causal_conv1d_update: accepted={accepted} outside the "
+                f"speculative state window (num_spec={num_spec})"
+            )
+        history = state[..., offset:offset + state_len].unsqueeze(0)
+        x_ref = seq_tokens.transpose(0, 1).unsqueeze(0)
+        out_ref, final_state = causal_conv1d_ref(
+            x_ref,
+            weight,
+            bias,
+            initial_states=history,
+            return_final_states=True,
+            activation=activation,
+        )
+        tail = seq_tokens[-num_spec:] if num_spec else seq_tokens[:0]
+        rolled = torch.cat([final_state.squeeze(0), tail.transpose(0, 1)], dim=-1)
+        state[..., :width_entries].copy_(rolled[..., -width_entries:])
+        # [1, dim, L] -> [L, dim]
+        return out_ref.squeeze(0).transpose(0, 1)
+
+    def _run_block(seq_tokens: torch.Tensor, state: torch.Tensor, i: int) -> torch.Tensor | None:
+        if num_accepted_tokens is None:
+            return _run_one(seq_tokens, state)
+        accepted = int(num_accepted_tokens[i].item())
+        if accepted <= 0:
+            return None
+        return _run_spec_block(seq_tokens, state, accepted)
+
     if query_start_loc is None:
         if x.dim() == 2:
             batch = x.shape[0]
@@ -252,28 +341,18 @@ def causal_conv1d_update(
                 state = _select_state(i)
                 if state is None:
                     continue
-                seq_tokens = x[i : i + 1]
-                if num_accepted_tokens is not None:
-                    accepted = int(num_accepted_tokens[i].item())
-                    if accepted <= 0:
-                        continue
-                    seq_tokens = seq_tokens[:accepted]
-                out_i = _run_one(seq_tokens, state)
-                out[i : i + out_i.shape[0]] = out_i
+                out_i = _run_block(x[i : i + 1], state, i)
+                if out_i is not None:
+                    out[i : i + out_i.shape[0]] = out_i
         else:
             batch = x.shape[0]
             for i in range(batch):
                 state = _select_state(i)
                 if state is None:
                     continue
-                seq_tokens = x[i]
-                if num_accepted_tokens is not None:
-                    accepted = int(num_accepted_tokens[i].item())
-                    if accepted <= 0:
-                        continue
-                    seq_tokens = seq_tokens[:accepted]
-                out_i = _run_one(seq_tokens, state)
-                out[i, : out_i.shape[0]] = out_i
+                out_i = _run_block(x[i], state, i)
+                if out_i is not None:
+                    out[i, : out_i.shape[0]] = out_i
     else:
         assert conv_state_indices is not None
         batch = conv_state_indices.size(0)
@@ -285,13 +364,8 @@ def causal_conv1d_update(
             state = _select_state(i)
             if state is None:
                 continue
-            seq_tokens = x[start:end]
-            if num_accepted_tokens is not None:
-                accepted = int(num_accepted_tokens[i].item())
-                if accepted <= 0:
-                    continue
-                seq_tokens = seq_tokens[:accepted]
-            out_i = _run_one(seq_tokens, state)
-            out[start : start + out_i.shape[0]] = out_i
+            out_i = _run_block(x[start:end], state, i)
+            if out_i is not None:
+                out[start : start + out_i.shape[0]] = out_i
 
     return out.to(original_x_dtype)

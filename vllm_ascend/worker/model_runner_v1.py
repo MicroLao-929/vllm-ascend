@@ -196,6 +196,7 @@ from vllm_ascend.utils import (
     weak_ref_tensors,
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
+from vllm_ascend.worker.external_decode import load_external_decode
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -296,6 +297,9 @@ class ExecuteModelState(NamedTuple):
 
 
 class NPUModelRunner(GPUModelRunner):
+    # Optional external decode adaptor (see external_decode.load_external_decode).
+    _external_decode = None
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Must be set before super().__init__() because parent init may call
         # _allocate_kv_cache_tensors which accesses self.use_compress.
@@ -2058,6 +2062,9 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if self._external_decode is not None:
+            self._external_decode.update_requests(self, scheduler_output)
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -2398,9 +2405,17 @@ class NPUModelRunner(GPUModelRunner):
                         mamba_copy_connector = connector
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            external_step = None
+            if self._external_decode is not None:
+                external_step = self._external_decode.try_decode(
+                    self, scheduler_output, get_forward_context(), positions, input_ids
+                )
+            if external_step is not None:
+                hidden_states = external_step.hidden_states
+            else:
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
             # Verify every scheduled layer executed its deferred copy.
             if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
                 mamba_copy_connector.finish_mamba_state_copy()
@@ -2429,7 +2444,12 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if external_step is not None and external_step.logits is not None:
+                    logits = self._external_decode.process_logits(
+                        self, external_step, logits_indices
+                    )
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3922,6 +3942,12 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
 
+        # Optional external decode fast path (protocol in
+        # vllm_ascend.worker.external_decode).  The adaptor is built after the
+        # model and its static forward context exist; it returns None from
+        # try_decode(...) whenever the native path must run.
+        self._external_decode = load_external_decode(self)
+
         load_model_total_time = time.perf_counter() - load_model_start_time
         logger.info(
             "Model runner load_model total time: %.2f seconds",
@@ -5008,12 +5034,29 @@ class NPUModelRunner(GPUModelRunner):
                 attn_backend = group_key.attn_backend
                 kv_cache_spec = group_key.kv_cache_spec
                 attn_metadata_builders = []
+                builder_cls = attn_backend.get_builder_cls()
+                builder_kwargs = {}
+                if getattr(builder_cls, "requires_block_table_width", False):
+                    # Mirrors vllm/v1/worker/utils.py: builders that opt in
+                    # (e.g. the paged-MQA indexer) need the padded block-table
+                    # width at construction time.
+                    from vllm.v1.worker.utils import get_block_table_width
+
+                    builder_kwargs["block_table_width"] = get_block_table_width(
+                        kv_cache_spec.max_num_blocks_per_req(
+                            self.vllm_config,
+                            self.vllm_config.model_config.max_model_len,
+                        ),
+                        kv_cache_spec.block_size,
+                        None,
+                    )
                 attn_metadata_builders.append(
-                    attn_backend.get_builder_cls()(
+                    builder_cls(
                         kv_cache_spec,
                         layer_names,
                         self.vllm_config,
                         self.device,
+                        **builder_kwargs,
                     )
                 )
                 attn_group = AttentionGroup(

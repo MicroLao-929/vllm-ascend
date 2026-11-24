@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import re
+import sys
 from collections.abc import Iterable
 from typing import Any, ClassVar, Literal
 
@@ -88,6 +91,19 @@ from .multimodal import (
     Glm5NextVisionTransformer,
 )
 from .ops.mhc_ops import hc_contract, hc_expand
+
+
+_DEBUG_TRACE = os.environ.get("GLM53_DEBUG_TRACE") == "1"
+_DEBUG_SYNC = os.environ.get("GLM53_DEBUG_SYNC") == "1"
+
+
+def trace(msg: str) -> None:
+    """Stage marker for kernel-fault localization (GLM53_DEBUG_TRACE=1)."""
+    if not _DEBUG_TRACE:
+        return
+    print(f"[glm53] {msg}", file=sys.stderr, flush=True)
+    if _DEBUG_SYNC:
+        torch.npu.synchronize()
 
 
 class Glm5NextMLP(nn.Module):
@@ -308,7 +324,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=quant_config,  # FLOAT entries fall back to BF16
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_nope,
@@ -415,6 +431,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post inputs (its ffn-pre outputs); when present, fuse that
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
+        trace(f"L{self.layer_idx} begin")
         x = hidden_states
         if post is None:
             if self.layer_idx == 0:
@@ -441,6 +458,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
 
+        trace(f"L{self.layer_idx} hc_pre")
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
@@ -450,6 +468,8 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states=x,
             positions=positions,
         )
+
+        trace(f"L{self.layer_idx} attn")
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
@@ -467,11 +487,15 @@ class Glm5NextDecoderLayer(nn.Module):
             norm_eps=self.post_attention_layernorm.variance_epsilon,
         )
 
+        trace(f"L{self.layer_idx} hc_ffn")
+
         # Fully Connected
         if self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+
+        trace(f"L{self.layer_idx} mlp")
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
@@ -633,6 +657,7 @@ class Glm5NextModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            trace(f"embedding {tuple(hidden_states.shape)}")
             residual = None
             post = None
             comb = None
@@ -649,8 +674,10 @@ class Glm5NextModel(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
+        trace("layers begin")
         for layer in self._active_layers:
             hidden_states, residual, post, comb = layer(positions, hidden_states, residual, post, comb)
+        trace("layers end")
 
         if not get_pp_group().is_last_rank:
             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
@@ -715,10 +742,43 @@ class Glm5NextModel(nn.Module):
             kwargs: dict = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue
+            # The standalone QuaRot tensor belongs to the MTP draft head and is
+            # already folded into the exported weights; drop it here.
+            if name == "rot.weight":
+                continue
+            # Text-only architecture: the checkpoint's vision tower has no
+            # module in this model.
+            if name.startswith("visual.") or ".visual." in name:
+                continue
+
+            # Names reaching this module are relative to it.  The checkpoint
+            # stores text layers as ``model.language_model.layers.*`` and the
+            # ``AutoWeightsLoader`` only strips the outer ``model.``, leaving a
+            # ``language_model.`` prefix that has no matching parameter.
+            for prefix in ("language_model.model.", "language_model.", "model."):
+                if name.startswith(prefix):
+                    name = name[len(prefix):]
+                    break
+            # The checkpoint nests the KDA forget gate as
+            # ``self_attn.forget_gate.*`` while the module keeps f_a_proj /
+            # f_b_proj / A_log / dt_bias flat on the attention layer.
+            name = name.replace(".forget_gate.", ".")
+            # The checkpoint keys the two mHC mixers as ``attn_hc.<field>`` /
+            # ``ffn_hc.<field>`` while the module calls them ``hc_attn_<field>``
+            # / ``hc_ffn_<field>``.
+            name = re.sub(r"^(layers\.\d+)\.attn_hc\.(base|scale|fn)$",
+                          r"\1.hc_attn_\2", name)
+            name = re.sub(r"^(layers\.\d+)\.ffn_hc\.(base|scale|fn)$",
+                          r"\1.hc_ffn_\2", name)
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+            # A reduced-depth config (debug/ablation) keeps the main model
+            # smaller than the checkpoint; ignore the layers it does not own.
+            layer_match = re.match(r"^layers\.(\d+)\.", name)
+            if layer_match and int(layer_match.group(1)) >= self.config.num_hidden_layers:
+                continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -896,8 +956,18 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Text-only architecture over a multimodal checkpoint: drop the vision
+        # tower and the MTP-only QuaRot tensor before the module dispatch (the
+        # latter is already folded into the exported merger weights).
+        def text_weights():
+            for item in weights:
+                name = item[0]
+                if name == "rot.weight" or name.startswith(("visual.", "model.visual.")):
+                    continue
+                yield item
+
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(text_weights())
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1101,8 +1171,10 @@ def _try_load_fp8_attn_proj(
     target_w = f"{layer_prefix}.{target_base}.weight"
     target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
     # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
+    # handle it (it has a weight_scale_inv param).  ModelSlim MXFP8 KDA
+    # checkpoints store the scale as ``weight_scale`` instead, so a layer that
+    # owns that parameter must load through the quantized path as well.
+    if target_s in params_dict or f"{layer_prefix}.{target_base}.weight_scale" in params_dict:
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})

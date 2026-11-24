@@ -118,13 +118,19 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         self._index_kpool = index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
-        from dataclasses import replace
+        from dataclasses import fields, replace
 
         spec = super().get_kv_cache_spec(vllm_config)
         # ``tokens_per_state`` is the KV-spec representation of kpool
-        # compression in the current cache-layout API.
+        # compression in the cache-layout API this model was written against.
+        # Newer vLLM snapshots replace it with the block ``compress_ratio``
+        # (``storage_block_size = block_size // compress_ratio``).
         assert isinstance(spec, MLAAttentionSpec)
-        spec = replace(spec, tokens_per_state=self._index_kpool)
+        spec_fields = {field.name for field in fields(spec)}
+        if "tokens_per_state" in spec_fields:
+            spec = replace(spec, tokens_per_state=self._index_kpool)
+        elif "compress_ratio" in spec_fields:
+            return replace(spec, compress_ratio=self._index_kpool)
 
         # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
         # (= block_size // index_kpool) is virtually split into pool pages of
@@ -181,21 +187,38 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         self._index_kpool = index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
-        # The two head slots form [K, gate score] in the generic
-        # [block, head, state, content] cache view.
-        return KpoolTailSpec(
-            block_size=self._index_kpool,
-            num_kv_heads=2,
-            head_size=self.head_dim,
-            head_size_v=0,
-            dtype=torch.bfloat16,
-            sliding_window=self._index_kpool,
-        )
+        # A dedicated 4-token sliding-window group cannot be reconciled with the
+        # 4096-token attention pages of this vLLM snapshot ("No common block
+        # size"), and the MegaKernel decode bridge never reads vLLM caches.
+        # Describe the tail as an ordinary pooled indexer cache instead: same
+        # block size as the rest of the model, one state per ``index_kpool``
+        # tokens.
+        from dataclasses import fields, replace
+
+        spec = super().get_kv_cache_spec(vllm_config)
+        spec_fields = {field.name for field in fields(spec)}
+        if "compress_ratio" in spec_fields:
+            return replace(spec, compress_ratio=self._index_kpool)
+        if "tokens_per_state" in spec_fields:
+            return replace(spec, tokens_per_state=self._index_kpool)
+        return spec
 
     def get_attn_backend(self):
-        from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
+        # ``KpoolTailBackend`` only exists in the vLLM snapshot this model was
+        # written against.  Other snapshots keep the generic paged-MQA indexer
+        # backend only; the tail cache is a plain sliding-window buffer and the
+        # serving paths that consume it (prefill seeding / PD transfer) are not
+        # exercised by the MegaKernel decode bridge.
+        try:
+            from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
 
-        return KpoolTailBackend
+            return KpoolTailBackend
+        except ImportError:
+            from vllm.v1.attention.backends.mla.indexer import (
+                DeepseekV32IndexerBackend,
+            )
+
+            return DeepseekV32IndexerBackend
 
 
 class Indexer(nn.Module):
@@ -496,11 +519,18 @@ class Glm5NextMLAAttention(nn.Module):
         self.is_v32 = config.index_topk is not None
 
         if self.is_v32:
-            self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
-                qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=not config.indexer_rope_interleave,
+            # NoPE checkpoints set qk_rope_head_dim=0; the indexer then has no
+            # rotary component at all (Indexer.forward skips it), and building
+            # a zero-width RoPE table raises inside the cache recorder.
+            self.indexer_rope_emb: RotaryEmbedding | None = (
+                get_rope(
+                    qk_rope_head_dim,
+                    max_position=max_position_embeddings,
+                    rope_parameters=config.rope_parameters,
+                    is_neox_style=not config.indexer_rope_interleave,
+                )
+                if qk_rope_head_dim > 0
+                else None
             )
             # The sparse indexer projects from the MLA q-lora rank, which is
             # always set for v32 MLA configs; narrow away the `int | None`.

@@ -103,7 +103,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             else:
                 i_t = 0
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64)
-            if state_idx <= 0:
+            # vLLM pads with PAD_SLOT_ID = -1; slot 0 is a real cache row.
+            if state_idx < 0:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
@@ -138,7 +139,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
         if INPLACE_FINAL_STATE:
             final_state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64)
-            if final_state_idx > 0:
+            if final_state_idx >= 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)

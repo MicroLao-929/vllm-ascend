@@ -81,6 +81,30 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Route Glm5NextForConditionalGeneration (GLM-5.3-Flash) token steps through
+    # the MegaKernel GLM-5.3 W4A4 graph: 0/1, default 0. Not sensitive.
+    "VLLM_ASCEND_GLM53_MEGAKERNEL": lambda: int(
+        os.getenv(
+            "VLLM_ASCEND_GLM53_MEGAKERNEL",
+            os.getenv("ENABLE_GLM53_MEGAKERNEL", "0"),
+        )
+    ),
+    # Let the vLLM model load its own (otherwise unused) parameters in addition
+    # to the MegaKernel's checkpoint load: 0/1, default 0 (saves the duplicate
+    # resident copy and avoids quantizing twice). Not sensitive.
+    "VLLM_ASCEND_GLM53_NATIVE_WEIGHTS": lambda: int(
+        os.getenv("VLLM_ASCEND_GLM53_NATIVE_WEIGHTS", "0")
+    ),
+    # Optional external decode adaptor, imported as ``package.module:factory``.
+    # The factory receives the model runner and must implement the protocol in
+    # ``vllm_ascend.worker.external_decode``. Default None keeps the native
+    # model path. Not sensitive.
+    "VLLM_ASCEND_EXTERNAL_DECODE_ADAPTOR": lambda: os.getenv("VLLM_ASCEND_EXTERNAL_DECODE_ADAPTOR"),
+    # Optional external MTP proposer, imported as ``package.module:factory``.
+    # The factory receives ``(vllm_config, device, runner)`` and must return a
+    # compatible native MTP proposer subclass. The default uses native MTP.
+    # This import path contains no credentials.
+    "VLLM_ASCEND_EXTERNAL_MTP_PROPOSER": lambda: os.getenv("VLLM_ASCEND_EXTERNAL_MTP_PROPOSER"),
 }
 
 # end-env-vars-definition

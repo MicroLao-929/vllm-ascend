@@ -353,6 +353,10 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
+        external = getattr(getattr(self, "model_runner", None), "drafter", None)
+        close_external = getattr(external, "close_external_mtp", None)
+        if callable(close_external):
+            close_external()
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
 

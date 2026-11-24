@@ -73,10 +73,20 @@ def register_model():
     ModelRegistry.register_model(
         "Eagle3LlamaForCausalLM", "vllm_ascend.models.llama_eagle3:AscendEagle3LlamaForCausalLM"
     )
-    ModelRegistry.register_model(
-        "Glm5NextForCausalLM",
-        "vllm_ascend.models.glm5next.model:Glm5NextForCausalLM",
-    )
+    if os.environ.get("ENABLE_GLM53_MEGAKERNEL", "0") in ("1", "true", "True"):
+        # Route the GLM-5.3-Flash text architecture through the MegaKernel W4A4
+        # graph (serve with --hf-overrides '{"architectures":
+        # ["Glm5NextForCausalLM"]}').
+        ModelRegistry.register_model(
+            "Glm5NextForCausalLM",
+            "vllm_ascend.models.glm_5_3_flash_mega:"
+            "AscendGlm53FlashMegaForCausalLM",
+        )
+    else:
+        ModelRegistry.register_model(
+            "Glm5NextForCausalLM",
+            "vllm_ascend.models.glm5next.model:Glm5NextForCausalLM",
+        )
     ModelRegistry.register_model(
         "Glm5NextForConditionalGeneration",
         "vllm_ascend.models.glm5next.model:Glm5NextForConditionalGeneration",

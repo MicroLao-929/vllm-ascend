@@ -18,6 +18,11 @@
 #
 
 
+import importlib
+
+from vllm.logger import logger
+
+from vllm_ascend import envs
 from vllm_ascend.spec_decode.dflash2_proposer import AscendDflash2Proposer, is_dflash2_draft
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -31,6 +36,37 @@ from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
 from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+
+
+def load_external_mtp_proposer(vllm_config, device, runner, native_cls):
+    """Build the configured external MTP proposer, or return ``None``.
+
+    ``VLLM_ASCEND_EXTERNAL_MTP_PROPOSER`` names a factory as
+    ``package.module:factory``.  The optional backend is imported only when the
+    variable is set; nothing is imported on the default native path.  A
+    deployment that asked for an external proposer must not silently fall back
+    to the native drafter, so import/build/type failures are raised.
+    """
+    spec = envs.VLLM_ASCEND_EXTERNAL_MTP_PROPOSER
+    if not spec:
+        return None
+    module_name, _, factory_name = spec.partition(":")
+    factory_name = factory_name or "build_proposer"
+    module = importlib.import_module(module_name)
+    factory = getattr(module, factory_name, None)
+    if not callable(factory):
+        raise ValueError(f"external MTP proposer {spec!r}: {module_name} has no callable {factory_name!r}")
+    proposer = factory(vllm_config, device, runner)
+    # The model runner and its attention-metadata dispatch use isinstance
+    # checks against the native proposer family, so the external instance must
+    # subclass whichever native proposer the method selected.
+    if not isinstance(proposer, native_cls):
+        raise TypeError(
+            f"external MTP proposer {spec!r} returned {type(proposer).__name__}, "
+            f"which is not a {native_cls.__name__}"
+        )
+    logger.info("[external-mtp] proposer %s loaded as %s", spec, type(proposer).__name__)
+    return proposer
 
 
 def get_spec_decode_method(method, vllm_config, device, runner):
@@ -47,8 +83,14 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method in ("eagle", "eagle3", "mtp"):
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None and speculative_config.use_step3p5_mtp():
-            return AscendStep3p5MTPProposer(vllm_config, device, runner)
-        return AscendEagleProposer(vllm_config, device, runner)
+            native_cls = AscendStep3p5MTPProposer
+        else:
+            native_cls = AscendEagleProposer
+        if method == "mtp":
+            external = load_external_mtp_proposer(vllm_config, device, runner, native_cls)
+            if external is not None:
+                return external
+        return native_cls(vllm_config, device, runner)
     elif method == "dflash":
         if is_dflash2_draft(vllm_config.speculative_config):
             return AscendDflash2Proposer(vllm_config, device, runner)

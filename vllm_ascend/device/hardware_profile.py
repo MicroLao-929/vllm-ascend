@@ -235,7 +235,9 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.GRAPH_NORM_QUANT_FUSION,
                     HardwareCapability.LOCAL_KV_COMM_RESOURCE,
                     HardwareCapability.LORA_CUSTOM_OPS,
-                    HardwareCapability.MLA_DECODE_PROLOG_WITHOUT_ROPE,
+                    # aclnnMlaPrologV3 on this CANN rejects a null ropeSin
+                    # ("Check ropeSin != nullptr failed"), so NoPE MLA decode
+                    # uses the generic preprocess path instead of the prolog.
                     HardwareCapability.MLAPO_NATIVE_WEIGHTS,
                     HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
                     HardwareCapability.MOE_DISPATCH_SHARED_EXPERT_ARGS,

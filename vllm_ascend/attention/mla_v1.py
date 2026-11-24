@@ -955,7 +955,18 @@ class AscendMLAImpl(MLAAttentionImpl):
                     attn_metadata_current = attn_metadata
 
                 layer_metadata = attn_metadata_current[key]
-                seq_lens_list = layer_metadata.decode.seq_lens_list
+                # DSA/indexer decode metadata carries ``seq_lens`` as a tensor
+                # (1-D for plain decode, 2-D for the native MTP path) instead of
+                # the precomputed host list the MLA metadata keeps.  Fall back to
+                # the tensor so graph-task updates work for NoPE MLA models.
+                seq_lens_list = getattr(layer_metadata.decode, "seq_lens_list", None)
+                if seq_lens_list is None:
+                    seq_lens_tensor = getattr(layer_metadata.decode, "seq_lens", None)
+                    if seq_lens_tensor is None:
+                        raise RuntimeError("MLA/indexer decode metadata has neither seq_lens_list nor seq_lens")
+                    seq_lens_list = seq_lens_tensor.tolist()
+                    if seq_lens_list and isinstance(seq_lens_list[0], list):
+                        seq_lens_list = [row[-1] for row in seq_lens_list]
                 if speculative_config and speculative_config.use_eagle() and not _EXTRA_CTX.is_draft_model:
                     actual_seq_lengths = layer_metadata.decode.actual_seq_lengths_q
                     spec_multiple = speculative_config.num_speculative_tokens + 1
