@@ -1,0 +1,829 @@
+{
+  "schema": "glm53.experimental.two-row.measurement.v1",
+  "status": "实验，未通过同 rank B1 输出对照",
+  "execution": {
+    "tp": 1,
+    "dp": 8,
+    "ep": 8,
+    "mtp": false,
+    "native_prefill": true,
+    "clients": 16,
+    "input": 128,
+    "output": 128
+  },
+  "native": {
+    "requests": 48,
+    "waves": 3,
+    "request_tpot_ms": [
+      20.051933622047244,
+      20.058051338582676,
+      20.05022803149606,
+      20.04161149606299,
+      20.056808897637794,
+      20.048318976377953,
+      20.058612677165353,
+      20.051984488188975,
+      20.052452283464568,
+      20.05054244094488,
+      20.048007086614174,
+      21.176126456692913,
+      20.057527716535432,
+      20.046250078740158,
+      20.05737566929134,
+      20.052013307086614,
+      19.902867559055117,
+      19.88859133858268,
+      19.89255905511811,
+      19.89411850393701,
+      19.891359842519684,
+      19.896524173228347,
+      19.902892755905512,
+      19.886086141732285,
+      19.902054881889764,
+      19.891635433070867,
+      19.891899291338582,
+      19.895286535433073,
+      19.891826377952757,
+      19.89823905511811,
+      19.90427220472441,
+      19.883916299212597,
+      19.88583881889764,
+      19.903288582677167,
+      19.88950535433071,
+      19.883399212598427,
+      19.89190779527559,
+      19.8984262992126,
+      19.90237433070866,
+      19.888948897637796,
+      19.890669133858268,
+      19.904125118110237,
+      19.888458661417324,
+      19.882714015748032,
+      19.894043937007876,
+      19.89843779527559,
+      19.898830393700788,
+      19.88941976377953
+    ],
+    "request_tpot_p50_ms": 19.898634094488187,
+    "e2e_wave_tokens_s": [
+      716.7050587975662,
+      753.5673965180315,
+      761.4465937104906
+    ],
+    "decode_wave_tokens_s": [
+      749.3158924749247,
+      803.3591704633393,
+      803.8317393136326
+    ],
+    "e2e_tokens_s": 753.5673965180315,
+    "decode_tokens_s": 803.3591704633393
+  },
+  "experimental": {
+    "requests": 48,
+    "waves": 3,
+    "request_tpot_ms": [
+      33.88043086614173,
+      33.88038157480315,
+      33.87831724409449,
+      33.87500692913386,
+      33.87914622047244,
+      33.876414566929135,
+      33.870347716535434,
+      33.86937188976378,
+      33.87703976377953,
+      33.88029196850394,
+      33.87637251968504,
+      33.87203858267716,
+      33.88220204724409,
+      33.87549763779528,
+      33.87440826771653,
+      33.870273858267716,
+      34.0882231496063,
+      34.08383023622047,
+      34.0978462992126,
+      34.08391960629921,
+      34.08191094488189,
+      34.07824984251968,
+      34.08040472440945,
+      34.066443622047245,
+      34.086533228346454,
+      34.082044881889765,
+      34.095718897637795,
+      34.083730551181105,
+      34.08267811023622,
+      34.078440787401576,
+      34.08155913385827,
+      34.06822913385827,
+      33.96839921259843,
+      33.96173614173228,
+      33.9691648031496,
+      33.95960425196851,
+      33.96888377952756,
+      33.9690974015748,
+      33.96429779527559,
+      33.98303070866142,
+      33.968615826771654,
+      33.96378181102362,
+      33.9710037007874,
+      33.96351700787402,
+      33.968647480314964,
+      33.968336614173225,
+      33.96476842519685,
+      33.9846094488189
+    ],
+    "request_tpot_p50_ms": 33.96850751968504,
+    "e2e_wave_tokens_s": [
+      447.26179873403817,
+      446.54809297232464,
+      445.1984006890906
+    ],
+    "decode_wave_tokens_s": [
+      472.1215281334082,
+      469.15058319804234,
+      470.7121935021661
+    ],
+    "e2e_tokens_s": 446.54809297232464,
+    "decode_tokens_s": 470.7121935021661
+  },
+  "actual_backend_counts": {
+    "native": {
+      "decode_positions": 6096,
+      "counts": {
+        "native_graph": 6095,
+        "native_eager": 1
+      },
+      "verified_request_ranks": 48,
+      "eight_rank_sixteen_request_epochs": 0
+    },
+    "target": {
+      "decode_positions": 6096,
+      "counts": {
+        "mk_full_t2": 6096
+      },
+      "verified_request_ranks": 48,
+      "eight_rank_sixteen_request_epochs": 381
+    },
+    "oracle": {
+      "decode_positions": 2032,
+      "counts": {
+        "mk_full_single": 2032
+      },
+      "verified_request_ranks": 16,
+      "eight_rank_sixteen_request_epochs": 0
+    }
+  },
+  "target_vs_serial_same_rank_b1": {
+    "requests": 16,
+    "exact_sequences": 0,
+    "matched_positions": 99,
+    "total_positions": 2048,
+    "identical_first": 12,
+    "second_equal_given_same_first": 4,
+    "first_divergence_1based": [
+      1,
+      1,
+      1,
+      3,
+      2,
+      2,
+      2,
+      2,
+      3,
+      4,
+      2,
+      2,
+      3,
+      2,
+      2,
+      1
+    ]
+  },
+  "target_vs_native_c16": {
+    "requests": 48,
+    "exact_sequences": 0,
+    "matched_positions": 266,
+    "total_positions": 6144,
+    "identical_first": 47,
+    "second_equal_given_same_first": 11,
+    "first_divergence_1based": [
+      2,
+      2,
+      2,
+      1,
+      2,
+      2,
+      2,
+      3,
+      3,
+      4,
+      2,
+      2,
+      3,
+      2,
+      2,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      2,
+      2,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      2,
+      2,
+      4,
+      2,
+      2,
+      2,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3
+    ]
+  },
+  "three_axes": [
+    {
+      "comparison": "原生 C8 与原生 C16（共享输入）",
+      "cases": 24,
+      "identical_first": 8,
+      "second_equal_given_same_first": 2,
+      "second_denominator": 8,
+      "exact_sequences": 0
+    },
+    {
+      "comparison": "B1_vs_earlier_B1_first8",
+      "cases": 8,
+      "identical_first": 8,
+      "second_equal_given_same_first": 8,
+      "second_denominator": 8,
+      "exact_sequences": 8
+    },
+    {
+      "comparison": "B1_vs_earlier_MK_C8_first8",
+      "cases": 8,
+      "identical_first": 8,
+      "second_equal_given_same_first": 8,
+      "second_denominator": 8,
+      "exact_sequences": 8
+    },
+    {
+      "comparison": "B1_vs_native_C8_first8",
+      "cases": 8,
+      "identical_first": 8,
+      "second_equal_given_same_first": 6,
+      "second_denominator": 8,
+      "exact_sequences": 3
+    },
+    {
+      "comparison": "B1_vs_native_cap1_C16_all",
+      "cases": 16,
+      "identical_first": 16,
+      "second_equal_given_same_first": 13,
+      "second_denominator": 16,
+      "exact_sequences": 9
+    },
+    {
+      "comparison": "B1_vs_native_cap1_C16_extra_slots",
+      "cases": 8,
+      "identical_first": 8,
+      "second_equal_given_same_first": 7,
+      "second_denominator": 8,
+      "exact_sequences": 6
+    },
+    {
+      "comparison": "B1_vs_native_cap2_C16_all",
+      "cases": 16,
+      "identical_first": 11,
+      "second_equal_given_same_first": 9,
+      "second_denominator": 11,
+      "exact_sequences": 5
+    },
+    {
+      "comparison": "B2_vs_B1_all",
+      "cases": 16,
+      "identical_first": 12,
+      "second_equal_given_same_first": 4,
+      "second_denominator": 12,
+      "exact_sequences": 0
+    },
+    {
+      "comparison": "真 B2 与原生 C16 全部请求",
+      "cases": 48,
+      "identical_first": 47,
+      "second_equal_given_same_first": 11,
+      "second_denominator": 47,
+      "exact_sequences": 0
+    }
+  ],
+  "short_audit": {
+    "true_b2_epochs": 30,
+    "verified_transitions": 480,
+    "recorded_transitions": 496,
+    "peak_received_rows": 52
+  },
+  "sources_sha256": {
+    "reports/mk-t2-r2-timed-static-stock13-h103-220627-718408-device-and-reference-summary.json": "9293acf46f64d848f7390e02641c86727865821ad27f08b4d11f2b8a6574521f",
+    "reports/103-B2-native-prefill-and-first-step-three-axes.json": "7dbef673790c7df7d372aecb60a68fddd848f7490bc31717d8a58310db53a53c",
+    "reports/mk-t2-r2-timed-static-stock13-h103-220627-718408-validated-pair.json": "83c2f110e53f19ebae34aeaf0354012ef42a7c03016ac7becf04342f295d2112",
+    "bench/mk-t2-r2-b1-oracle-static-stock13-h103-220627-718408/oracle/serial-c16.jsonl": "771074e41f76495882d9fe62844820dc5de03d6896f725ea36319c8b7e91b49b"
+  },
+  "per_b1_input": [
+    {
+      "slot": 0,
+      "actual_rank": 0,
+      "positions": 128,
+      "matched_positions": 4,
+      "first_divergence_1based": 1,
+      "first_equal": false,
+      "second_equal": false
+    },
+    {
+      "slot": 1,
+      "actual_rank": 1,
+      "positions": 128,
+      "matched_positions": 0,
+      "first_divergence_1based": 1,
+      "first_equal": false,
+      "second_equal": false
+    },
+    {
+      "slot": 2,
+      "actual_rank": 2,
+      "positions": 128,
+      "matched_positions": 0,
+      "first_divergence_1based": 1,
+      "first_equal": false,
+      "second_equal": false
+    },
+    {
+      "slot": 3,
+      "actual_rank": 3,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3,
+      "first_equal": true,
+      "second_equal": true
+    },
+    {
+      "slot": 4,
+      "actual_rank": 4,
+      "positions": 128,
+      "matched_positions": 9,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 5,
+      "actual_rank": 5,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 6,
+      "actual_rank": 6,
+      "positions": 128,
+      "matched_positions": 36,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 7,
+      "actual_rank": 7,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 8,
+      "actual_rank": 0,
+      "positions": 128,
+      "matched_positions": 6,
+      "first_divergence_1based": 3,
+      "first_equal": true,
+      "second_equal": true
+    },
+    {
+      "slot": 9,
+      "actual_rank": 1,
+      "positions": 128,
+      "matched_positions": 34,
+      "first_divergence_1based": 4,
+      "first_equal": true,
+      "second_equal": true
+    },
+    {
+      "slot": 10,
+      "actual_rank": 2,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 11,
+      "actual_rank": 3,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 12,
+      "actual_rank": 4,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3,
+      "first_equal": true,
+      "second_equal": true
+    },
+    {
+      "slot": 13,
+      "actual_rank": 5,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 14,
+      "actual_rank": 6,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2,
+      "first_equal": true,
+      "second_equal": false
+    },
+    {
+      "slot": 15,
+      "actual_rank": 7,
+      "positions": 128,
+      "matched_positions": 0,
+      "first_divergence_1based": 1,
+      "first_equal": false,
+      "second_equal": false
+    }
+  ],
+  "vs_native_per_input": [
+    {
+      "wave": 1,
+      "slot": 0,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 1,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 2,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 3,
+      "positions": 128,
+      "matched_positions": 0,
+      "first_divergence_1based": 1
+    },
+    {
+      "wave": 1,
+      "slot": 4,
+      "positions": 128,
+      "matched_positions": 39,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 5,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 6,
+      "positions": 128,
+      "matched_positions": 36,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 7,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 1,
+      "slot": 8,
+      "positions": 128,
+      "matched_positions": 7,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 1,
+      "slot": 9,
+      "positions": 128,
+      "matched_positions": 34,
+      "first_divergence_1based": 4
+    },
+    {
+      "wave": 1,
+      "slot": 10,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 11,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 12,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 1,
+      "slot": 13,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 14,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 1,
+      "slot": 15,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 2,
+      "slot": 0,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 1,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 2,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 3,
+      "positions": 128,
+      "matched_positions": 63,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 4,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 5,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 6,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 2,
+      "slot": 7,
+      "positions": 128,
+      "matched_positions": 8,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 8,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 9,
+      "positions": 128,
+      "matched_positions": 3,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 2,
+      "slot": 10,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 11,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 12,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 13,
+      "positions": 128,
+      "matched_positions": 9,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 14,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 2,
+      "slot": 15,
+      "positions": 128,
+      "matched_positions": 3,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 3,
+      "slot": 0,
+      "positions": 128,
+      "matched_positions": 3,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 1,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 2,
+      "positions": 128,
+      "matched_positions": 3,
+      "first_divergence_1based": 4
+    },
+    {
+      "wave": 3,
+      "slot": 3,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 4,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 5,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 6,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3
+    },
+    {
+      "wave": 3,
+      "slot": 7,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 8,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 9,
+      "positions": 128,
+      "matched_positions": 11,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 10,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 11,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 12,
+      "positions": 128,
+      "matched_positions": 6,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 13,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 14,
+      "positions": 128,
+      "matched_positions": 1,
+      "first_divergence_1based": 2
+    },
+    {
+      "wave": 3,
+      "slot": 15,
+      "positions": 128,
+      "matched_positions": 2,
+      "first_divergence_1based": 3
+    }
+  ]
+}
