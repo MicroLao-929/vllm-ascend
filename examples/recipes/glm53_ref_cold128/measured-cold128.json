@@ -1,0 +1,109 @@
+{
+  "model": "45-layer GLM-5.3 Flash W4A4, ordinary target",
+  "official_git": "2d4f96473945a4a1c4149d0360eeb8b64e848369",
+  "topology": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 8,
+    "mtp": false
+  },
+  "shape": {
+    "warmup": 1,
+    "formal_requests": 7,
+    "concurrency": 1,
+    "input_tokens": 128,
+    "output_tokens": 128,
+    "prefix_cache": false
+  },
+  "plan": {
+    "policy": "required",
+    "state": "original_plan_confirmed",
+    "matched_worker_count": 8,
+    "original_sha256": "5ee116026e720cdd348a5ed164713dfcbd6edfdf3d69b297c3bb55d6dbea03a5",
+    "confirmed_graph_ops": 2122,
+    "confirmed_graph_nodes": 20806,
+    "confirmed_schedule_tasks": 20231
+  },
+  "ordinary_tpot": {
+    "units": "milliseconds per token; median of seven (first-to-last output)/127 means",
+    "native_graph_ms": 14.733387401574802,
+    "cold_mk_ms": 13.52331157480315,
+    "latency_reduction_pct": 8.213154204051609,
+    "decode_rate_ratio": 1.0894807325911418,
+    "native_per_request_ms": [
+      14.688356929133858,
+      14.670892755905513,
+      14.761383622047244,
+      14.761555748031496,
+      14.733387401574802,
+      14.684325826771653,
+      14.758511417322834
+    ],
+    "cold_mk_per_request_ms": [
+      13.367098031496063,
+      13.344186771653543,
+      13.627476771653543,
+      13.689229763779528,
+      13.342558503937008,
+      13.52331157480315,
+      13.81061
+    ]
+  },
+  "oracle": {
+    "matched_ids": 689,
+    "total_ids": 896,
+    "identical_sequences": 5,
+    "first_different_output_1based": [
+      null,
+      null,
+      null,
+      2,
+      null,
+      39,
+      null
+    ]
+  },
+  "true_rank_kv": {
+    "native_prefills": 56,
+    "first_private_kv_imports": 56,
+    "later_uses_without_reimport": 7056,
+    "ordered_graph_and_complete_pairs": 7112,
+    "all_synchronous_writeback": true
+  },
+  "frozen_runtime_files_matched": 34,
+  "hbm": {
+    "native": {
+      "samples": 1,
+      "exclusive_samples": 1,
+      "foreign_samples": 0,
+      "max_per_card_mib": {
+        "0": 91762,
+        "1": 91763,
+        "2": 91763,
+        "3": 91764,
+        "4": 91766,
+        "5": 91764,
+        "6": 91765,
+        "7": 91763
+      },
+      "max_sum_device_mib": 734110,
+      "max_sum_own_process_mib": 695792
+    },
+    "mk-required": {
+      "samples": 1,
+      "exclusive_samples": 0,
+      "foreign_samples": 1,
+      "max_per_card_mib": null,
+      "max_sum_device_mib": null,
+      "max_sum_own_process_mib": null
+    }
+  },
+  "source_sha256": {
+    "independent_rank_kv_and_ids": "8ff475bd6a7955095dafdc7a8f2c566d4e59d6c8e48107d5766eef97b4f3ec95",
+    "native_requests": "d3c15794928347f9c771c04a4bbdcc7c78d98fd783c12cea0a488fe9a4554b4c",
+    "mk_requests": "04effbb80c2946aef102d7a2c6725331ab3d0a2e8f01a5e84a02d8982d89ceef",
+    "verified_pair": "283d108f32df4c2c2c39dc45362203645862daafedb1f7cd2b9dda843c8a6c6c",
+    "verified_hbm": "f89b71b3870bea160fdae7a40eade2470b0b8a369283bc254034f6eda51e7570"
+  },
+  "stock_performance": null
+}

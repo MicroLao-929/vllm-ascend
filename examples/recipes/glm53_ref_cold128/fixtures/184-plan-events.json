@@ -1,0 +1,10 @@
+{
+  "source": "bench/reference255-original-h184-110006-183903/board/mk-final/service.log",
+  "source_sha256": "e344beeba126b25dd108def4cc4ed0595e323249296e1f634d52e5e58492c16c",
+  "fixture_sha256": "169bed4772b685f610f63caa0acb0004fdddc590ab9b71583d96608bb50299dc",
+  "exact_matched_log_substrings": {
+    "typed": 8,
+    "static": 8,
+    "import": 24
+  }
+}
